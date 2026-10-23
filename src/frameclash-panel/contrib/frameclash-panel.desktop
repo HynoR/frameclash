@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FrameClash
+Comment=Proxy status, start/stop and node selection on the SteamVR dashboard. Launch again while running to open the panel.
+Comment[zh_CN]=在 SteamVR 仪表板上查看代理状态、启停代理、切换节点。运行中再次启动即可打开面板
+# The installer replaces @BINARY@ with the absolute path (Steam may start it without ~/.local/lib in PATH)
+Exec=@BINARY@ --show
+# absolute path: Steam reads the icon theme only when it starts
+Icon=@ICON@
+Terminal=false
+Categories=Network;

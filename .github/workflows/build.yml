@@ -1,0 +1,87 @@
+# Every push / PR: Go tests, script syntax, the panel built and unit-tested on arm64, the release tarball packed.
+# A pushed tag vX.Y.Z also publishes that tarball + SHA256SUMS as a GitHub release, with the notes taken from the
+# "## X.Y.Z" section of CHANGELOG.md.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  daemon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: src/frameclashd/go.mod
+          cache-dependency-path: src/frameclashd/go.sum
+      - run: go vet ./... && go test ./...
+        working-directory: src/frameclashd
+      - run: bash -n pkg/*.sh tools/*.sh tools/panel-preview/*.sh
+
+  panel:
+    # The Frame builds the panel itself at install time; this catches compile errors first. Debian trixie on arm64,
+    # like tools/panel-preview, with a stub libopenvr_api.
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ninja-build g++ pkg-config \
+            libcairo2-dev libfreetype-dev libvulkan-dev libxcb1-dev
+      - run: |
+          mkdir -p /tmp/ovr
+          g++ -shared -fPIC -Isrc/frameclash-panel/third_party/openvr -o /tmp/ovr/libopenvr_api.so \
+            tools/panel-preview/openvr_stub.cpp
+          cmake -G Ninja -S src/frameclash-panel -B /tmp/panel -DCMAKE_BUILD_TYPE=Release -DOPENVR_LIB_DIR=/tmp/ovr
+          ninja -C /tmp/panel
+          /tmp/panel/frameclash-panel-tests
+
+  package:
+    needs: [daemon, panel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: src/frameclashd/go.mod
+          cache-dependency-path: src/frameclashd/go.sum
+      - name: Tag matches the version in the source
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          grep -qx "var version = \"$ver\"" src/frameclashd/main.go || { echo "main.go version != $ver"; exit 1; }
+          grep -q "VERSION $ver " src/frameclash-panel/CMakeLists.txt || { echo "CMakeLists version != $ver"; exit 1; }
+      - run: tools/make-package.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: frameclash-${{ github.sha }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '$1 == "##" { on = $2 == v; next } on' CHANGELOG.md > notes.md
+          grep -q '[^[:space:]]' notes.md || { echo "CHANGELOG.md has no '## $ver' section"; exit 1; }
+          cat >> notes.md <<EOF
+
+          ### Install
+
+          Steam Frame only (SteamOS VR, aarch64). Download both files, then follow
+          [Install](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/README.md#install) in the README.
+          EOF
+          gh release create "$GITHUB_REF_NAME" --title "$ver" --notes-file notes.md --verify-tag \
+            dist/frameclash-"$ver"-steamframe-aarch64.tar.gz dist/SHA256SUMS

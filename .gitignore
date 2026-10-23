@@ -1,0 +1,8 @@
+.DS_Store
+build/
+dist/
+vendor/
+__pycache__/
+tools/ns.py
+/local/
+CLAUDE.md

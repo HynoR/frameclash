@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FrameClash</title>
+<style>
+:root{--bg:#0f1420;--card:#18202f;--fg:#e6edf3;--mut:#8b949e;--acc:#4ea1ff;--ok:#3fb950;--bad:#f85149}
+*{box-sizing:border-box}body{margin:0;font:20px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+main{max-width:1100px;margin:auto;padding:20px}h1{font-size:30px;margin:0 0 12px}h2{font-size:22px;margin:0 0 10px}
+.card{background:var(--card);border-radius:14px;padding:18px;margin-bottom:16px}
+button{font:inherit;padding:12px 22px;border-radius:10px;border:0;background:var(--acc);color:#fff;cursor:pointer;margin:4px 6px 4px 0}
+button.sec{background:#30363d}button.stop{background:var(--bad)}button:disabled{opacity:.5}
+input,textarea{font:inherit;width:100%;padding:10px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:var(--fg)}
+textarea{height:160px;font-family:monospace;font-size:15px}.mut{color:var(--mut);font-size:16px}
+.badge{display:inline-block;padding:4px 12px;border-radius:999px;font-weight:600}.on{background:var(--ok)}.off{background:#484f58}
+.err{color:var(--bad);white-space:pre-wrap;font-size:16px}.grp{margin:10px 0 18px}.nodes{display:flex;flex-wrap:wrap;gap:8px}
+.node{background:#21262d;padding:10px 14px;border-radius:8px;cursor:pointer;font-size:17px}.node.sel{outline:3px solid var(--acc)}
+.d{color:var(--mut);font-size:14px;margin-left:6px}
+</style></head><body><main>
+<h1>FrameClash <span class="mut" id="ver"></span></h1>
+<div class="card"><h2>状态 Status</h2>
+ <div><span id="badge" class="badge off">…</span> <span id="src" class="mut"></span></div>
+ <div class="mut" id="proxy"></div><div class="err" id="err"></div>
+ <button id="bStart" onclick="act('/api/start')">开启 Start</button>
+ <button id="bStop" class="stop" onclick="act('/api/stop')">关闭 Stop</button>
+ <button id="bTun" class="sec" onclick="tun()">TUN</button> <span class="mut" id="tunInfo"></span>
+</div>
+<div class="card"><h2>订阅导入 Subscription URL</h2>
+ <input id="url" placeholder="https://…（Clash/mihomo 格式订阅）">
+ <button onclick="sub()">导入 Import</button><button class="sec" onclick="act('/api/subscription/refresh')">更新 Refresh</button>
+</div>
+<div class="card"><h2>本地配置 Local YAML</h2>
+ <div class="mut">粘贴或选择文件；或把文件放到 <code id="lp"></code> 后点“从文件重新加载”。</div>
+ <input type="file" id="file" accept=".yaml,.yml,text/yaml" onchange="loadFile(this)">
+ <textarea id="yaml" placeholder="proxies: …"></textarea>
+ <button onclick="local()">导入 Import</button><button class="sec" onclick="act('/api/local/reload')">从文件重新加载 Reload file</button>
+</div>
+<div class="card"><h2>节点 Nodes</h2><div id="groups" class="mut">代理未运行</div></div>
+<div class="card"><h2>日志 Log</h2><button class="sec" onclick="showLog()">刷新 Refresh</button><pre id="log" class="mut" style="white-space:pre-wrap;max-height:300px;overflow:auto"></pre></div>
+</main><script>
+const H={'X-FrameClash':'1','Content-Type':'application/json'};
+const $=id=>document.getElementById(id);
+async function post(p,b){const r=await fetch(p,{method:'POST',headers:H,body:JSON.stringify(b||{})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j}
+async function act(p){busy(true);try{await post(p);$('err').textContent=''}catch(e){$('err').textContent=e.message}busy(false);refresh()}
+async function sub(){busy(true);try{await post('/api/subscription',{url:$('url').value});$('err').textContent='订阅已导入 OK';$('url').value=''}catch(e){$('err').textContent=e.message}busy(false);refresh()}
+async function local(){busy(true);try{await post('/api/local',{yaml:$('yaml').value});$('err').textContent='本地配置已导入 OK'}catch(e){$('err').textContent=e.message}busy(false);refresh()}
+let tunOn=false;
+async function tun(){busy(true);try{await post('/api/tun',{enable:!tunOn});$('err').textContent=''}catch(e){$('err').textContent=e.message}busy(false);refresh()}
+function loadFile(i){const f=i.files[0];if(f)f.text().then(t=>$('yaml').value=t)}
+function busy(b){document.querySelectorAll('button').forEach(x=>x.disabled=b)}
+async function refresh(){
+ const s=await (await fetch('/api/status')).json();
+ $('ver').textContent='v'+s.version;$('badge').textContent=s.running?'运行中 Running (pid '+s.pid+')':'已停止 Stopped';
+ $('badge').className='badge '+(s.running?'on':'off');
+ $('src').textContent=s.source?('配置来源: '+(s.source==='url'?'订阅 '+s.sub_url:'本地文件')+' · '+(s.last_update||'')):'尚未导入配置';
+ tunOn=s.tun;$('bTun').textContent=s.tun?'关闭 TUN':'开启 TUN';
+ $('tunInfo').textContent=s.tun_ready?s.tun_ready:(s.tun?'TUN 开：wlan0 流量全部走代理（串流 wlanap / 局域网直连）':'TUN 关：仅 127.0.0.1:7890 代理');
+ $('proxy').textContent='代理地址 Proxy: '+s.proxy+'（HTTP + SOCKS5，仅本机）';$('lp').textContent=s.local_path;
+ if(s.error&&!$('err').textContent)$('err').textContent=s.error;
+ if(s.running)groups();else $('groups').textContent='代理未运行';
+}
+async function groups(){
+ const r=await fetch('/api/proxies');if(!r.ok){$('groups').textContent='controller 未就绪';return}
+ const p=(await r.json()).proxies||{};const g=$('groups');g.innerHTML='';
+ const order=(p.GLOBAL&&p.GLOBAL.all)||Object.keys(p);
+ for(const name of ['GLOBAL',...order]){const x=p[name];if(!x||x.type!=='Selector')continue;if(name==='GLOBAL'&&order.length>1)continue;
+  const d=document.createElement('div');d.className='grp';d.innerHTML='<b></b> <span class="mut"></span><div class="nodes"></div>';
+  d.querySelector('b').textContent=name;d.querySelector('span').textContent='→ '+x.now;
+  for(const n of x.all){const b=document.createElement('span');b.className='node'+(n===x.now?' sel':'');b.textContent=n;
+   const h=(p[n]&&p[n].history)||[];if(h.length){const t=document.createElement('span');t.className='d';t.textContent=h[h.length-1].delay+'ms';b.appendChild(t)}
+   b.onclick=async()=>{try{await post('/api/select',{group:name,name:n})}catch(e){$('err').textContent=e.message}groups()};
+   b.oncontextmenu=async e=>{e.preventDefault();try{await post('/api/delay',{name:n})}catch(e){$('err').textContent=n+': '+e.message}groups()};
+   d.querySelector('.nodes').appendChild(b)}
+  g.appendChild(d)}
+ if(!g.children.length)g.textContent='配置中没有 Selector 分组';
+}
+async function showLog(){$('log').textContent=await (await fetch('/api/log')).text()}
+refresh();setInterval(refresh,5000);
+</script></body></html>

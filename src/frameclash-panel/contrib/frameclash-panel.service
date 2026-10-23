@@ -1,0 +1,28 @@
+# Adapted from frameeyeosc's panel/contrib/frameeyeosc-panel.service
+# (https://github.com/sasaken1102r/frameeyeosc, MIT; see THIRD_PARTY_NOTICES.md).
+[Unit]
+Description=FrameClash panel (SteamVR dashboard panel for the FrameClash proxy)
+Documentation=file://%h/.local/lib/frameclash/README.md
+# An OpenVR overlay, so it only runs while SteamVR does
+After=steamvr.service
+PartOf=steamvr.service
+
+[Service]
+# FRAMECLASH_UI_ADDR (where frameclashd listens) comes from the same file frameclash.service reads
+EnvironmentFile=-%h/.config/frameclash/env
+ExecStart=%h/.local/lib/frameclash/frameclash-panel
+# Also come back when only SteamVR restarts (steamvr.service keeps running). When steamvr.service stops,
+# PartOf stops this unit too, so it is not restarted then
+Restart=always
+RestartSec=5
+# "close" on the dashboard icon and "another instance is already running" exit with 3:
+# don't restart, and don't count it as a failure
+RestartPreventExitStatus=3
+SuccessExitStatus=3
+# The panel handles SIGTERM itself (removes its overlay, then disconnects from SteamVR)
+KillSignal=SIGTERM
+TimeoutStopSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=steamvr.service

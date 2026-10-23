@@ -1,0 +1,17 @@
+mixed-port: 7890
+mode: rule
+proxies:
+  - {name: "🇭🇰 香港 01丨1x HK", type: socks5, server: 192.0.2.1, port: 1080}
+  - {name: "🇭🇰 香港 02丨1x HK", type: socks5, server: 192.0.2.2, port: 1080}
+  - {name: "🇯🇵 日本 东京 01", type: socks5, server: 192.0.2.3, port: 1080}
+  - {name: "🇺🇸 美国 洛杉矶 高速", type: socks5, server: 192.0.2.4, port: 1080}
+  - {name: "🇸🇬 Singapore 03 Premium", type: socks5, server: 192.0.2.5, port: 1080}
+  - {name: "🇹🇼 台湾 家宽", type: socks5, server: 192.0.2.6, port: 1080}
+proxy-groups:
+  - {name: "🚀 节点选择", type: select, proxies: ["♻️ 自动选择", "🇭🇰 香港 01丨1x HK", "🇭🇰 香港 02丨1x HK", "🇯🇵 日本 东京 01", "🇺🇸 美国 洛杉矶 高速", "🇸🇬 Singapore 03 Premium", "🇹🇼 台湾 家宽", DIRECT]}
+  - {name: "♻️ 自动选择", type: url-test, url: "http://www.gstatic.com/generate_204", interval: 3000, proxies: ["🇭🇰 香港 01丨1x HK", "🇯🇵 日本 东京 01"]}
+  - {name: "🎮 Steam", type: select, proxies: [DIRECT, "🚀 节点选择"]}
+  - {name: "🐟 漏网之鱼", type: select, proxies: ["🚀 节点选择", DIRECT]}
+rules:
+  - DOMAIN-SUFFIX,steampowered.com,🎮 Steam
+  - MATCH,🐟 漏网之鱼

@@ -1,0 +1,23 @@
+[Unit]
+Description=FrameClash (mihomo proxy controller; system proxy, optional TUN)
+Documentation=file://%h/.local/lib/frameclash/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/frameclash/env
+ExecStart=%h/.local/lib/frameclash/frameclashd
+# Stop = SIGTERM to every process of the unit, mihomo included (it removes its TUN state itself); never SIGKILL.
+# control-group, not mixed: if frameclashd dies, mixed would leave mihomo running and systemd then refuses to
+# restart a SendSIGKILL=no unit while it has processes ("result 'resources'"), leaving the panel without a daemon.
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=no
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+# No NoNewPrivileges=: it would make the kernel ignore the file capability of the TUN copy of mihomo
+UMask=0077
+
+[Install]
+WantedBy=default.target
