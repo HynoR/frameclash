@@ -209,3 +209,73 @@ func (a *App) hTunDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonOut(w, 200, map[string]bool{"ok": true})
 }
+
+func tunSetupScript(home, mihomo string) string {
+	script := filepath.Join(filepath.Dir(mihomo), "tun-setup.sh")
+	home = filepath.Clean(home)
+	if home != "." && strings.HasPrefix(script, home+string(filepath.Separator)) {
+		return "~" + strings.TrimPrefix(script, home)
+	}
+	return script
+}
+
+func tunSuggest(helperErr string, outdated bool, selfDNS bool, dnsAllowed *bool, leftovers []string) string {
+	if outdated {
+		return "install"
+	}
+	if helperErr != "" && len(leftovers) > 0 {
+		return "cleanup"
+	}
+	if helperErr != "" {
+		return "install"
+	}
+	if selfDNS && dnsAllowed != nil && !*dnsAllowed {
+		return "install"
+	}
+	if len(leftovers) > 0 {
+		return "repair"
+	}
+	return ""
+}
+
+type tunSetupInfo struct {
+	Script         string   `json:"script"`
+	Helper         string   `json:"helper"`
+	HelperOutdated bool     `json:"helper_outdated"`
+	DNSAllowed     *bool    `json:"dns_allowed,omitempty"`
+	SelfDNS        bool     `json:"self_dns"`
+	Running        bool     `json:"running"`
+	Leftovers      []string `json:"leftovers"`
+	Suggest        string   `json:"suggest"`
+}
+
+func (a *App) hTunSetup(w http.ResponseWriter, r *http.Request) {
+	helperErr := ""
+	if err := tunReady(a.home); err != nil {
+		helperErr = err.Error()
+	}
+	outdated := false
+	if helperErr == "" {
+		bundled, bundledErr := os.Stat(a.mihomo)
+		helper, helperStatErr := os.Stat(tunBinary(a.home))
+		outdated = bundledErr == nil && helperStatErr == nil && bundled.Size() != helper.Size()
+	}
+	a.mu.Lock()
+	running := a.running()
+	selfDNS := !a.state.NoSelfDNS
+	a.mu.Unlock()
+	leftovers := []string{}
+	if !running {
+		leftovers = tunLeftovers()
+	}
+	var dnsAllowed *bool
+	if pkcheck, err := exec.LookPath("pkcheck"); err == nil {
+		dnsAllowed = new(exec.Command(pkcheck, "--action-id", "org.freedesktop.resolve1.set-domains",
+			"--process", fmt.Sprint(os.Getpid())).Run() == nil)
+	}
+	jsonOut(w, http.StatusOK, tunSetupInfo{
+		Script: tunSetupScript(a.home, a.mihomo), Helper: helperErr, HelperOutdated: outdated,
+		DNSAllowed: dnsAllowed, SelfDNS: selfDNS, Running: running, Leftovers: leftovers,
+		Suggest: tunSuggest(helperErr, outdated, selfDNS, dnsAllowed, leftovers),
+	})
+}

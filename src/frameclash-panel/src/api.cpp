@@ -378,3 +378,147 @@ std::string cleanFieldText(const std::string& s, size_t maxBytes) {
     if (out.size() > maxBytes) out.resize(utf8Prefix(out, maxBytes));
     return out;
 }
+
+bool parseTunSetup(const std::string& json, TunSetup& out, std::string& error) {
+    JsonValue v;
+    if (!parseJson(json, v, error)) return false;
+    if (!v.isObject()) {
+        error = "TUN setup is not an object";
+        return false;
+    }
+    out = {};
+    out.have = true;
+    out.script = str(v, "script");
+    out.helper = str(v, "helper");
+    out.helperOutdated = boolean(v, "helper_outdated");
+    if (const JsonValue* allowed = v.get("dns_allowed"); allowed != nullptr && allowed->isBool()) {
+        out.haveDnsAllowed = true;
+        out.dnsAllowed = allowed->boolean;
+    }
+    out.selfDns = boolean(v, "self_dns");
+    out.running = boolean(v, "running");
+    if (const JsonValue* left = v.get("leftovers"); left != nullptr && left->isArray())
+        for (const JsonValue& item : left->items)
+            if (item.isString()) out.leftovers.push_back(item.text);
+    out.suggest = str(v, "suggest");
+    return true;
+}
+
+bool parseConnList(const std::string& json, ConnList& out, std::string& error) {
+    JsonValue v;
+    if (!parseJson(json, v, error)) return false;
+    if (!v.isObject()) {
+        error = "connections is not an object";
+        return false;
+    }
+    out = {};
+    out.have = true;
+    out.total = static_cast<int>(num(v, "total"));
+    out.matched = static_cast<int>(num(v, "matched"));
+    out.upTotal = static_cast<int64_t>(num(v, "upload_total"));
+    out.downTotal = static_cast<int64_t>(num(v, "download_total"));
+    if (const JsonValue* groups = v.get("groups"); groups != nullptr && groups->isArray()) {
+        for (const JsonValue& item : groups->items) {
+            if (!item.isObject()) continue;
+            ConnGroup group;
+            group.key = str(item, "key");
+            group.count = static_cast<int>(num(item, "count"));
+            group.up = static_cast<int64_t>(num(item, "upload"));
+            group.down = static_cast<int64_t>(num(item, "download"));
+            group.oldestS = static_cast<int>(num(item, "oldest_s"));
+            out.groups.push_back(std::move(group));
+        }
+    }
+    if (const JsonValue* conns = v.get("connections"); conns != nullptr && conns->isArray()) {
+        for (const JsonValue& item : conns->items) {
+            if (!item.isObject()) continue;
+            ConnEntry entry;
+            entry.id = str(item, "id");
+            entry.network = str(item, "network");
+            entry.type = str(item, "type");
+            entry.host = str(item, "host");
+            entry.process = str(item, "process");
+            entry.rule = str(item, "rule");
+            entry.chain = str(item, "chain");
+            entry.group = str(item, "group");
+            entry.port = static_cast<int>(num(item, "port"));
+            entry.up = static_cast<int64_t>(num(item, "upload"));
+            entry.down = static_cast<int64_t>(num(item, "download"));
+            entry.ageS = static_cast<int>(num(item, "age_s"));
+            out.conns.push_back(std::move(entry));
+        }
+    }
+    return true;
+}
+
+std::vector<LogLine> parseLogLines(const std::string& text, size_t maxLines) {
+    std::vector<LogLine> out;
+    for (size_t pos = 0; pos <= text.size();) {
+        const size_t end = text.find('\n', pos);
+        const bool last = end == std::string::npos;
+        std::string raw = text.substr(pos, last ? std::string::npos : end - pos);
+        if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+        if (last) pos = text.size() + 1;
+        else pos = end + 1;
+        if (raw.empty()) continue;
+        LogLine line;
+        line.msg = raw;
+        if (raw.rfind("---", 0) == 0) {
+            line.marker = true;
+            out.push_back(std::move(line));
+            continue;
+        }
+        size_t cursor = 0;
+        auto quoted = [&](const std::string& prefix, std::string& value) {
+            if (raw.compare(cursor, prefix.size(), prefix) != 0) return false;
+            cursor += prefix.size();
+            value.clear();
+            while (cursor < raw.size()) {
+                const char c = raw[cursor++];
+                if (c == '"') return true;
+                if (c == '\\' && cursor < raw.size()) {
+                    const char escaped = raw[cursor++];
+                    if (escaped == '"' || escaped == '\\') value += escaped;
+                    else {
+                        value += '\\';
+                        value += escaped;
+                    }
+                } else {
+                    value += c;
+                }
+            }
+            return false;
+        };
+        bool valid = quoted("time=\"", line.time);
+        if (valid && cursor < raw.size() && raw[cursor++] == ' ' && raw.compare(cursor, 6, "level=") == 0) {
+            cursor += 6;
+            const size_t space = raw.find(' ', cursor);
+            if (space != std::string::npos) {
+                line.level = raw.substr(cursor, space - cursor);
+                cursor = space + 1;
+                valid = quoted("msg=\"", line.msg);
+            } else {
+                valid = false;
+            }
+        } else {
+            valid = false;
+        }
+        if (!valid) {
+            line = {};
+            line.msg = raw;
+        } else if (const size_t t = line.time.find('T'); t != std::string::npos && line.time.size() >= t + 9) {
+            line.time = line.time.substr(t + 1, 8);
+        }
+        out.push_back(std::move(line));
+    }
+    if (out.size() > maxLines) out.erase(out.begin(), out.end() - static_cast<long>(maxLines));
+    return out;
+}
+
+bool parseLogLevel(const std::string& json, std::string& level) {
+    JsonValue v;
+    std::string error;
+    if (!parseJson(json, v, error) || !v.isObject()) return false;
+    level = str(v, "level");
+    return !level.empty();
+}

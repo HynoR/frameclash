@@ -52,6 +52,49 @@ struct ConnSummary {
     int64_t download = 0;
 };
 
+struct TunSetup {
+    bool have = false;
+    std::string script, helper;
+    bool helperOutdated = false;
+    bool haveDnsAllowed = false, dnsAllowed = false;
+    bool selfDns = true, running = false;
+    std::vector<std::string> leftovers;
+    std::string suggest;
+};
+
+struct ConnGroup {
+    std::string key;
+    int count = 0;
+    int64_t up = 0, down = 0;
+    int oldestS = 0;
+};
+
+struct ConnEntry {
+    std::string id, network, type, host, process, rule, chain, group;
+    int port = 0;
+    int64_t up = 0, down = 0;
+    int ageS = 0;
+};
+
+struct ConnList {
+    bool have = false;
+    int total = 0;
+    int matched = 0;  ///< connections in the shown group (details view)
+    int64_t upTotal = 0, downTotal = 0;
+    std::vector<ConnGroup> groups;
+    std::vector<ConnEntry> conns;
+};
+
+struct LogLine {
+    std::string time, level, msg;
+    bool marker = false;
+};
+
+bool parseTunSetup(const std::string& json, TunSetup& out, std::string& error);
+bool parseConnList(const std::string& json, ConnList& out, std::string& error);
+std::vector<LogLine> parseLogLines(const std::string& text, size_t maxLines);
+bool parseLogLevel(const std::string& json, std::string& level);
+
 /** One saved profile from /api/profiles (0.2.1). URLs arrive masked; the panel never sees a full subscription URL. */
 struct ProfileEntry {
     std::string id;

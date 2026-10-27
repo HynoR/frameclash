@@ -13,5 +13,6 @@ proxy-groups:
   - {name: "🎮 Steam", type: select, proxies: [DIRECT, "🚀 节点选择"]}
   - {name: "🐟 漏网之鱼", type: select, proxies: ["🚀 节点选择", DIRECT]}
 rules:
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
   - DOMAIN-SUFFIX,steampowered.com,🎮 Steam
   - MATCH,🐟 漏网之鱼

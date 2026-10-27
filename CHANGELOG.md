@@ -3,6 +3,24 @@
 A release is made by pushing a tag `vX.Y.Z` whose `## X.Y.Z` section below becomes the release notes
 (`.github/workflows/build.yml`).
 
+## 0.6.0
+
+- New **TUN Setup** panel: helper version, polkit DNS permission and leftover checks, suggested install / repair /
+  cleanup actions, and copyable full-path commands for the Frame's own terminal. Adds `GET /api/tun/setup` and
+  `frameclash tun setup`. The panel copies a command to the clipboard (the X CLIPBOARD, which gamescope shares), ready to paste into Konsole.
+- New **Connections** panel and CLI: group by process, host, rule or chain, inspect newest-first details, and close a
+  single connection, a group, or everything. The daemon parses mihomo's full response and returns only bounded results.
+- New **Logs** panel and CLI: follow or scroll the current log, read the previous log, filter levels, clear, or change
+  mihomo's level temporarily. Log reads are tail-only and bounded; starts append markers instead of truncating, with
+  one `.prev` file rotated at the next start after 4 MiB. Clearing is safe while mihomo keeps writing (no NUL gap).
+- mihomo now runs at `log-level: silent` by default (logs only when asked); `override.yaml` or the Logs panel's level
+  button turn it back on.
+- One-line install / update: `curl -fsSL https://github.com/HynoR/frameclash/releases/latest/download/get.sh | bash`
+  (`pkg/get.sh`, published with each release; checks SHA256SUMS, then runs `install.sh`).
+- The sidebar's language button is now a 中文 / EN switch.
+- Preview fixtures now keep real local connections open, and Go / panel tests cover the new parsers, grouping,
+  closing, TUN suggestions and log rotation / truncation.
+
 ## 0.5.0
 
 First public release: mihomo (Clash.Meta) on the Steam Frame, controlled from the SteamVR dashboard, a local web page

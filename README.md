@@ -11,7 +11,10 @@ Decky, no root service.
   - **Overview**: start/stop, live speed, TUN and DNS switches, outbound mode (Rule / Global / Direct), the current
     node, an exit-IP check and "Repair network".
   - **Proxies**: proxy groups, node selection, latency tests.
+  - **Connections**: group by process, host or rule; inspect and close one connection, a group, or all of them.
+  - **Logs**: follow the latest log, read the previous log, filter levels, clear, or temporarily change mihomo's level.
   - **Profiles**: import a subscription URL or a Clash/mihomo YAML file, and switch, refresh or remove saved profiles.
+  - **TUN Setup**: check helper, DNS permission and leftovers, then copy the exact setup or cleanup command.
 - **System proxy** on `127.0.0.1:7890` (HTTP + SOCKS5) by default.
 - **TUN mode** (optional) for games and UDP. Only `wlan0` goes through the proxy; the PC-streaming AP (`wlanap`),
   `usb0` and the LAN stay direct.
@@ -23,15 +26,21 @@ Decky, no root service.
 
 ## Install
 
-Requires a Steam Frame (SteamOS VR, aarch64) with SteamVR. Each
-[release](https://github.com/HynoR/frameclash/releases) has `frameclash-<version>-steamframe-aarch64.tar.gz` and
-`SHA256SUMS`. Use the release's version in place of `0.5.0`.
-
-On the Frame, open Konsole or SSH in. To see Konsole in the app list, first turn on Steam Settings → System →
-Enable Developer Mode. Then:
+Requires a Steam Frame (SteamOS VR, aarch64) with SteamVR. On the Frame, open Konsole (to see it in the app list,
+first turn on Steam Settings → System → Enable Developer Mode) or SSH in, and run:
 
 ```sh
-ver=0.5.0
+curl -fsSL https://github.com/HynoR/frameclash/releases/latest/download/get.sh | bash
+```
+
+It downloads the latest [release](https://github.com/HynoR/frameclash/releases), checks its SHA256 and runs
+`install.sh`. Options: `... | bash -s -- --no-panel` (no VR panel), `... | FRAMECLASH_VERSION=0.6.0 bash` (a given
+release).
+
+By hand: each release has `frameclash-<version>-steamframe-aarch64.tar.gz` and `SHA256SUMS`.
+
+```sh
+ver=0.6.0
 base=https://github.com/HynoR/frameclash/releases/download/v$ver
 curl -fLO $base/frameclash-$ver-steamframe-aarch64.tar.gz && curl -fLO $base/SHA256SUMS
 sha256sum -c SHA256SUMS
@@ -46,7 +55,7 @@ If the Frame can't reach GitHub, download both files on a computer and copy them
 `scp frameclash-*-steamframe-aarch64.tar.gz SHA256SUMS steamos@<frame-ip>:~`. Then run the commands above from
 `sha256sum -c` on.
 
-To update, repeat the same steps with a newer release; your profiles and settings are kept. To uninstall, run
+To update, run the same command again (or repeat the steps with a newer release); your profiles and settings are kept. To uninstall, run
 `~/.local/lib/frameclash/uninstall.sh --purge`.
 
 ## Usage
@@ -62,7 +71,10 @@ To update, repeat the same steps with a newer release; your profiles and setting
    ~/.local/lib/frameclash/tun-setup.sh install
    ```
 
-   This step asks for sudo. Afterwards, turn on the TUN switch in the panel.
+   This step asks for sudo. You can also open **TUN Setup**, copy the suggested command, paste it into the Frame's
+   terminal, run it yourself, then press **Check again**. Afterwards, turn on the TUN switch in the panel.
+6. **Connections** shows live groups and details; **Logs** reads the current or previous mihomo log without flooding
+   the panel with the full file.
 
 If something goes wrong, press **Repair network**. It needs a second tap to confirm, then stops the proxy and
 removes leftover TUN state. Press Start to bring the proxy back.

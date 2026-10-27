@@ -80,8 +80,9 @@ jobs:
 
           ### Install
 
-          Steam Frame only (SteamOS VR, aarch64). Download both files, then follow
-          [Install](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/README.md#install) in the README.
+          Steam Frame only (SteamOS VR, aarch64). In Konsole on the Frame:
+          \`curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/get.sh | bash\`
+          (or see [Install](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/README.md#install)).
           EOF
           gh release create "$GITHUB_REF_NAME" --title "$ver" --notes-file notes.md --verify-tag \
-            dist/frameclash-"$ver"-steamframe-aarch64.tar.gz dist/SHA256SUMS
+            dist/frameclash-"$ver"-steamframe-aarch64.tar.gz dist/SHA256SUMS pkg/get.sh

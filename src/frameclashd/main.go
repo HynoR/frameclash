@@ -6,10 +6,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,7 +33,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var version = "0.5.0"
+var version = "0.6.0"
 
 //go:embed ui/index.html
 var uiFS embed.FS
@@ -226,6 +229,9 @@ func (a *App) render(src []byte) ([]byte, error) {
 	if cfg == nil {
 		return nil, errors.New("empty config")
 	}
+	// Quiet by default: a woken headset logged ~5000 lines in 2 minutes at the profiles' usual warning. Set before the
+	// override, so override.yaml's log-level wins; the panel / `frameclash log level` change it until the next start.
+	cfg["log-level"] = "silent"
 	// ~/.config/frameclash/override.yaml: the user's own changes on top of every profile (like Clash Verge's
 	// override), e.g. dns.listen. FrameClash's forced settings below still win.
 	if b, err := os.ReadFile(a.p("override.yaml")); err == nil {
@@ -350,8 +356,12 @@ func (a *App) startLocked() error {
 		a.lastErr = err.Error()
 		return err
 	}
-	lf, err := os.OpenFile(a.logFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	lf, err := openLog(a.logFile)
 	if err != nil {
+		return err
+	}
+	if err := writeLogStart(lf, a.state.TUN); err != nil {
+		lf.Close()
 		return err
 	}
 	bin := a.mihomo
@@ -529,6 +539,7 @@ func (a *App) routes() http.Handler {
 	m.HandleFunc("POST /api/profiles/delete", a.hProfileDelete)
 	m.HandleFunc("POST /api/tun", a.hTun)
 	m.HandleFunc("POST /api/tun/dns", a.hTunDNS)
+	m.HandleFunc("GET /api/tun/setup", a.hTunSetup)
 	m.HandleFunc("POST /api/repair", a.hRepair)
 	m.HandleFunc("POST /api/mode", a.hMode)
 	m.HandleFunc("GET /api/exitip", a.hExitIP)
@@ -537,7 +548,12 @@ func (a *App) routes() http.Handler {
 	m.HandleFunc("POST /api/delay", a.hDelay)
 	m.HandleFunc("POST /api/groupdelay", a.hGroupDelay)
 	m.HandleFunc("GET /api/conn", a.hConn)
+	m.HandleFunc("GET /api/connections", a.hConnections)
+	m.HandleFunc("POST /api/connections/close", a.hCloseConns)
 	m.HandleFunc("GET /api/log", a.hLog)
+	m.HandleFunc("POST /api/log/clear", a.hLogClear)
+	m.HandleFunc("GET /api/loglevel", a.hLogLevel)
+	m.HandleFunc("POST /api/loglevel", a.hLogLevel)
 	return guard(m)
 }
 
@@ -764,23 +780,8 @@ func (a *App) hGroupDelay(w http.ResponseWriter, r *http.Request) {
 
 // hConn: a small summary of mihomo /connections (totals and count), so the VR panel doesn't parse the full list.
 func (a *App) hConn(w http.ResponseWriter, r *http.Request) {
-	resp, err := a.ctl("GET", "/connections", nil)
+	in, err := a.fetchConns()
 	if err != nil {
-		errOut(w, fmt.Errorf("mihomo controller: %w", err))
-		return
-	}
-	defer resp.Body.Close()
-	var in struct {
-		DownloadTotal int64             `json:"downloadTotal"`
-		UploadTotal   int64             `json:"uploadTotal"`
-		Connections   []json.RawMessage `json:"connections"`
-		Memory        int64             `json:"memory"`
-	}
-	if resp.StatusCode != 200 {
-		errOut(w, fmt.Errorf("mihomo controller: HTTP %d", resp.StatusCode))
-		return
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&in); err != nil {
 		errOut(w, err)
 		return
 	}
@@ -854,11 +855,140 @@ func (a *App) hExitIP(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, 200, map[string]string{"ip": in.IP, "country": in.Country, "city": in.City, "org": in.Org})
 }
 
-func (a *App) hLog(w http.ResponseWriter, r *http.Request) {
-	b, _ := os.ReadFile(a.logFile)
-	if len(b) > 16000 {
-		b = b[len(b)-16000:]
+const logRotateBytes = 4 << 20
+
+func openLog(path string) (*os.File, error) {
+	if st, err := os.Stat(path); err == nil && st.Size() > logRotateBytes {
+		// ponytail: rotated only at start; a log storm within one run can still grow the file — cap it if that is ever seen
+		if err := os.Rename(path, path+".prev"); err != nil {
+			return nil, err
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+}
+
+func writeLogStart(w io.Writer, tun bool) error {
+	state := "off"
+	if tun {
+		state = "on"
+	}
+	_, err := fmt.Fprintf(w, "--- frameclashd %s: mihomo start %s (TUN %s) ---\n",
+		version, time.Now().Format(time.RFC3339), state)
+	return err
+}
+
+func tailFile(path string, n int64) ([]byte, error) {
+	if n <= 0 {
+		return []byte{}, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if st.Size() > n {
+		if _, err := f.Seek(st.Size()-n, io.SeekStart); err != nil {
+			return nil, err
+		}
+		b, err := io.ReadAll(io.LimitReader(f, n))
+		if err != nil {
+			return nil, err
+		}
+		_, tail, found := bytes.Cut(b, []byte{'\n'})
+		if !found {
+			return []byte{}, nil
+		}
+		return tail, nil
+	}
+	return io.ReadAll(io.LimitReader(f, n))
+}
+
+func (a *App) hLog(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write(b)
+	n := int64(16000)
+	if raw := r.URL.Query().Get("bytes"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 1 {
+			http.Error(w, "bytes must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		n = min(parsed, int64(262144))
+	}
+	path := a.logFile
+	if r.URL.Query().Get("prev") == "1" {
+		path += ".prev"
+	}
+	b, err := tailFile(path, n)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(b)
+}
+
+func (a *App) hLogClear(w http.ResponseWriter, r *http.Request) {
+	if err := os.Truncate(a.logFile, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errOut(w, err)
+		return
+	}
+	if err := os.Remove(a.logFile + ".prev"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errOut(w, err)
+		return
+	}
+	jsonOut(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *App) hLogLevel(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		resp, err := a.ctl("GET", "/configs", nil)
+		if err != nil {
+			errOut(w, fmt.Errorf("mihomo controller: %w", err))
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			errOut(w, fmt.Errorf("mihomo controller: HTTP %d", resp.StatusCode))
+			return
+		}
+		var cfg struct {
+			Level string `json:"log-level"`
+		}
+		if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, 1<<20), &cfg); err != nil {
+			errOut(w, err)
+			return
+		}
+		jsonOut(w, http.StatusOK, map[string]string{"level": cfg.Level})
+		return
+	}
+	var in struct {
+		Level string `json:"level"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		errOut(w, err)
+		return
+	}
+	switch in.Level {
+	case "debug", "info", "warning", "error", "silent":
+	default:
+		errOut(w, errors.New("level must be debug, info, warning, error or silent"))
+		return
+	}
+	body, _ := jsonv2.Marshal(map[string]string{"log-level": in.Level})
+	resp, err := a.ctl("PATCH", "/configs", bytes.NewReader(body))
+	if err != nil {
+		errOut(w, fmt.Errorf("mihomo controller: %w", err))
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		errOut(w, fmt.Errorf("mihomo controller: HTTP %d", resp.StatusCode))
+		return
+	}
+	jsonOut(w, http.StatusOK, map[string]bool{"ok": true})
 }

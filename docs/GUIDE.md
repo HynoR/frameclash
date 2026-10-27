@@ -27,9 +27,17 @@ backend. FrameClash is standalone and runs as your user:
 status                         is the proxy running, which profile, the proxy address
 start | stop                   start / stop the proxy (stop also turns autostart off)
 tun on|off                     TUN mode (needs tun-setup.sh install once)
+tun dns on|off                 TUN: point systemd-resolved into the tun (default on), or leave it alone
+tun setup                      helper, DNS permission and leftovers; print the suggested full-path command
+conns [--by process|host|rule|chain|none] [--key K] [-n N]
+                               grouped connections (default process), or details with --by none / --key
+conns close all | ID | --by process|host|rule|chain --key K
+                               close every connection, one ID, or one group
+log [--prev] [-n BYTES]        current or previous log tail (default 16000, at most 262144 bytes)
+log clear                      truncate the current log and remove the previous one
+log level [LEVEL]              show or temporarily set debug|info|warning|error|silent (not saved)
 mode rule|global|direct        outbound mode (saved, applied without a restart; default rule)
 exit-ip                        where proxied traffic leaves to the internet (asks ipinfo.io)
-tun dns on|off                 TUN: point systemd-resolved into the tun (default on), or leave it alone
 repair                         stop the proxy and remove anything TUN left behind (no root)
 import-url URL [--name NAME]   import a subscription (URL "-" = read it from stdin)
 import-file PATH [--name NAME] import a Clash/mihomo YAML file under your home folder
@@ -51,6 +59,27 @@ for `ssh host command`); reading the URL from stdin keeps it out of shell histor
 ssh steamos@<frame-ip> '~/.local/bin/frameclash status'
 pbpaste | ssh steamos@<frame-ip> '~/.local/bin/frameclash import-url - --name Home'
 ```
+
+## Connections and logs
+
+The **Connections** panel groups live mihomo connections by process, host or rule, or shows newest-first details.
+Select a group to inspect only that group. Closing one row, a group, or everything requires a second tap; the CLI
+equivalents are above. The daemon parses the full mihomo response and sends the panel only summaries and at most
+200 details, rather than sending several megabytes into the VR process.
+
+The **Logs** panel follows the latest lines until you scroll up, and offers a button to return to the tail. It keeps
+500 parsed lines in memory. **Current / Previous** switches between `mihomo.log` and `mihomo.log.prev`; **Clear**
+truncates the current file and removes the previous one. Restarting mihomo appends a start marker instead of erasing
+history. At the next start after the file exceeds 4 MiB, it is renamed to `.prev` (replacing the older one), so a log
+storm during one run can still grow the current file.
+
+mihomo runs at `log-level: silent` by default (whatever the profile says), so the log stays small; only a few start-up
+lines and the start markers are written. To keep a level, put `log-level: warning` (or `info`, ...) in
+`~/.config/frameclash/override.yaml`. The level button changes mihomo through its API and cycles silent → error →
+warning → info → debug (`frameclash log level LEVEL` does the same); it is temporary and the default returns after
+restart. Turn on `info` while chasing a connection problem: it logs one line per connection. For a continuous terminal view:
+`tail -f ~/.local/share/frameclash/mihomo.log`. Logs can contain provider URLs: view them only in your own panel or
+terminal; FrameClash does not copy them into its journal.
 
 ## Web UI
 
@@ -104,6 +133,13 @@ updates and is not `nosuid`) and `/etc/polkit-1/rules.d/49-frameclash-resolved.r
 call resolved's `set-dns-servers` and `set-domains`. frameclashd refuses the copy unless the directory and file are
 root-owned, not writable by others, not symlinks, and carry the capability. Re-run `install` after updating FrameClash.
 Compare the sha256 it prints with the release before typing your password: `~/.local/lib` is writable by your user.
+
+The **TUN Setup** panel checks these helper files, compares the helper with the bundled mihomo, asks `pkcheck` about
+DNS permission, and checks for leftovers while the proxy is stopped. It suggests `install`, no-root **Repair network**,
+or `cleanup`. Copy the command and paste it into the Frame's own terminal, or type the large command shown on screen;
+the script always shows its changes and asks before using sudo. After running it, press **Check again**. If this manual
+check finds that DNS permission has been repaired, FrameClash applies TUN DNS without restarting mihomo.
+`frameclash tun setup` prints the same three status lines and a suggested full-path command.
 
 **TUN DNS** (`frameclash tun dns on|off`, the panel's DNS switch; default on): systemd-resolved sends its queries
 bound to `wlan0`, which bypasses the tun, so apps would get the network's (possibly poisoned) answers. With TUN DNS
@@ -239,7 +275,7 @@ section as its notes; it refuses a tag that doesn't match the version or has no 
 ```
 src/frameclashd/        Go daemon + CLI + web UI (ui/index.html embedded); TUN in tun.go, recovery in recovery.go
 src/frameclash-panel/   C++17 SteamVR dashboard panel (cairo, FreeType, Vulkan, OpenVR); tests/, contrib/ (unit, launcher)
-pkg/                    install.sh, uninstall.sh, tun-setup.sh, proxy-env.sh, unit, launcher, env.example, icon
+pkg/                    get.sh (one-line installer), install.sh, uninstall.sh, tun-setup.sh, proxy-env.sh, unit, launcher, env.example, icon
 tools/make-package.sh   builds dist/frameclash-<version>-steamframe-aarch64.tar.gz + SHA256SUMS
 .github/workflows/      CI (Go tests, panel build + tests on arm64, package); a pushed tag vX.Y.Z publishes a release
 ```

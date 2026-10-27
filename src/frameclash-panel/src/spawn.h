@@ -27,3 +27,8 @@ bool spawnDetached(const std::vector<std::string>& program, std::string& error);
 /** Clipboard text for "Paste" (0.2.1): the X CLIPBOARD selection read with libxcb ($DISPLAY, then each local X
  *  socket; gamescope's Xwayland holds it on the Frame), 1.5 s timeout, at most 64 KB. The text is never logged. @return "" with `error` set when there is nothing to paste. */
 std::string readClipboard(std::string& error);
+
+/** Own CLIPBOARD on a worker thread and serve UTF-8 text. @return "" on success, else why ownership failed. */
+std::string copyToClipboard(const std::string& text);
+/** Stop the clipboard worker (at most one 250 ms poll); X clears a selection when its owner exits. */
+void stopClipboard();

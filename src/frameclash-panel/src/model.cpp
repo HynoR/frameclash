@@ -34,6 +34,22 @@ int runWait(std::vector<std::string> args) {
     return WEXITSTATUS(status);
 }
 
+std::string queryEscape(const std::string& text) {
+    const char* hex = "0123456789ABCDEF";
+    std::string out;
+    for (const unsigned char c : text) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+            c == '.' || c == '~') {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 int64_t nowMs() {
@@ -77,6 +93,7 @@ void Model::push(Op op) {
 }
 
 void Model::poll() { push({Op::Kind::Poll, "", ""}); }
+void Model::checkSetup() { push({Op::Kind::CheckSetup, "", ""}); }
 void Model::start() { push({Op::Kind::Start, "", ""}); }
 void Model::stop() { push({Op::Kind::Stop, "", ""}); }
 void Model::setTun(bool on) { push({Op::Kind::Tun, on ? "true" : "false", ""}); }
@@ -93,6 +110,24 @@ void Model::importUrl(const std::string& url, const std::string& name) { push({O
 void Model::importFile(const std::string& path, const std::string& name) { push({Op::Kind::ImportFile, path, name}); }
 void Model::activateProfile(const std::string& id) { push({Op::Kind::Activate, id, ""}); }
 void Model::deleteProfile(const std::string& id) { push({Op::Kind::Delete, id, ""}); }
+void Model::closeConns(const std::string& which) { push({Op::Kind::CloseConns, which, ""}); }
+void Model::clearLog() { push({Op::Kind::ClearLog, "", ""}); }
+void Model::setLogLevel(const std::string& level) { push({Op::Kind::LogLevel, level, ""}); }
+
+void Model::setDetail(Detail detail, std::string a, std::string b) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        changed = detail_ != detail || detailA_ != a || detailB_ != b;
+        if (changed) {
+            detail_ = detail;
+            detailA_ = std::move(a);
+            detailB_ = std::move(b);
+            if (detail == Detail::Logs) logLevelDirty_ = true;
+        }
+    }
+    if (changed) poll();
+}
 
 void Model::finishImport(const HttpResult& r, const std::string& okEn, const std::string& okZh,
                          const std::string& failEn, const std::string& failZh) {
@@ -146,8 +181,18 @@ void Model::loop() {
         queue_.pop_front();
         running_ = true;
         lock.unlock();
-        if (op.kind == Op::Kind::Poll) {
+        if (op.kind == Op::Kind::Poll || op.kind == Op::Kind::CheckSetup) {
             doPoll();
+            if (op.kind == Op::Kind::CheckSetup) {
+                bool applyDns = false;
+                {
+                    std::lock_guard<std::mutex> guard(mutex_);
+                    applyDns = snap_.reach == Reach::Ok && snap_.status.running && snap_.status.tun &&
+                               snap_.status.tunDns == "no-permission" && snap_.setup.have && snap_.setup.haveDnsAllowed &&
+                               snap_.setup.dnsAllowed;
+                }
+                if (applyDns) setTunDns(true);
+            }
         } else {
             doAction(op);
             doPoll();  // show the action's effect at once
@@ -194,31 +239,94 @@ void Model::doPoll() {
         const HttpResult c = httpRequest(port_, "GET", "/api/conn", "", kQuickTimeoutMs);
         if (c.ok && c.status == 200) parseConn(c.body, conn);
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    // speeds: the change in mihomo's totals since the last poll (a restart resets them: shown as 0)
-    const int64_t now = nowMs();
-    if (conn.have && snap_.conn.have && now > lastConnAtMs_) {
-        const double dt = static_cast<double>(now - lastConnAtMs_) / 1000;
-        snap_.upSpeed = std::max<int64_t>(0, conn.upload - snap_.conn.upload) / dt;
-        snap_.downSpeed = std::max<int64_t>(0, conn.download - snap_.conn.download) / dt;
-    } else {
-        snap_.upSpeed = snap_.downSpeed = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // speeds: the change in mihomo's totals since the last poll (a restart resets them: shown as 0)
+        const int64_t now = nowMs();
+        if (conn.have && snap_.conn.have && now > lastConnAtMs_) {
+            const double dt = static_cast<double>(now - lastConnAtMs_) / 1000;
+            snap_.upSpeed = std::max<int64_t>(0, conn.upload - snap_.conn.upload) / dt;
+            snap_.downSpeed = std::max<int64_t>(0, conn.download - snap_.conn.download) / dt;
+        } else {
+            snap_.upSpeed = snap_.downSpeed = 0;
+        }
+        lastConnAtMs_ = now;
+        snap_.reach = Reach::Ok;
+        snap_.reachError.clear();
+        snap_.status = parsed;
+        snap_.nodes = std::move(nodes);
+        snap_.groups = std::move(groups);
+        snap_.conn = conn;
+        snap_.haveProfiles = haveProfiles;
+        snap_.profiles = std::move(profiles);
+        if (!parsed.running) {
+            snap_.testedDelay.clear();
+            snap_.exitIp = {};
+            snap_.exitIpError.clear();
+        }
+        ++snap_.seq;
     }
-    lastConnAtMs_ = now;
-    snap_.reach = Reach::Ok;
-    snap_.reachError.clear();
-    snap_.status = parsed;
-    snap_.nodes = std::move(nodes);
-    snap_.groups = std::move(groups);
-    snap_.conn = conn;
-    snap_.haveProfiles = haveProfiles;
-    snap_.profiles = std::move(profiles);
-    if (!parsed.running) {
-        snap_.testedDelay.clear();
-        snap_.exitIp = {};
-        snap_.exitIpError.clear();
+    Detail detail;
+    std::string a, b;
+    int interval;
+    bool levelDirty;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        detail = detail_;
+        a = detailA_;
+        b = detailB_;
+        interval = intervalMs_;
+        levelDirty = logLevelDirty_;
     }
-    ++snap_.seq;
+    if (interval > 2000 || detail == Detail::None) return;
+    auto stillCurrentLocked = [&] {
+        return detail_ == detail && detailA_ == a && detailB_ == b && intervalMs_ <= 2000;
+    };
+    if (detail == Detail::Conns) {
+        const std::string path = "/api/connections?by=" + queryEscape(a) + "&key=" + queryEscape(b) + "&limit=200";
+        const HttpResult r = httpRequest(port_, "GET", path, "", kQuickTimeoutMs);
+        ConnList list;
+        if (r.ok && r.status == 200 && !parseConnList(r.body, list, error)) list = {};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stillCurrentLocked()) {
+                snap_.connList = std::move(list);
+                ++snap_.seq;
+            }
+        }
+    } else if (detail == Detail::Logs) {
+        const std::string path = std::string("/api/log?bytes=65536") + (a == "prev" ? "&prev=1" : "");
+        const HttpResult r = httpRequest(port_, "GET", path, "", kQuickTimeoutMs);
+        std::vector<LogLine> lines;
+        if (r.ok && r.status == 200) lines = parseLogLines(r.body, 500);
+        std::string level;
+        const bool haveLevel = levelDirty && [&] {
+            const HttpResult lr = httpRequest(port_, "GET", "/api/loglevel", "", kQuickTimeoutMs);
+            return lr.ok && lr.status == 200 && parseLogLevel(lr.body, level);
+        }();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stillCurrentLocked()) {
+                snap_.logLines = std::move(lines);
+                if (levelDirty) {
+                    snap_.logLevel = haveLevel ? level : "";
+                    logLevelDirty_ = false;
+                }
+                ++snap_.seq;
+            }
+        }
+    } else if (detail == Detail::Setup) {
+        const HttpResult r = httpRequest(port_, "GET", "/api/tun/setup", "", kActionTimeoutMs);
+        TunSetup setup;
+        if (r.ok && r.status == 200 && !parseTunSetup(r.body, setup, error)) setup = {};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stillCurrentLocked()) {
+                snap_.setup = std::move(setup);
+                ++snap_.seq;
+            }
+        }
+    }
 }
 
 void Model::doAction(const Op& op) {
@@ -370,9 +478,64 @@ void Model::doAction(const Op& op) {
         case Op::Kind::Repair: {
             setBusy(Busy::Repairing);
             r = httpRequest(port_, "POST", "/api/repair", "{}", kRefreshTimeoutMs);
-            if (r.ok && r.status == 200) setMessage("Network repaired. The proxy is off; press Start to use it again.",
-                                                    "网络已修复。代理已关闭，需要时再点「启动」。", false);
-            else setMessage("Repair failed: " + apiErrorText(r), "修复失败：" + apiErrorText(r), true);
+            const bool ok = r.ok && r.status == 200;
+            const std::string why = ok ? "" : apiErrorText(r);
+            const bool cleanup = !ok && why.find("tun-setup.sh cleanup") != std::string::npos;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                snap_.needCleanup = cleanup;
+                ++snap_.seq;
+            }
+            if (ok) {
+                setMessage("Network repaired. The proxy is off; press Start to use it again.",
+                           "网络已修复。代理已关闭，需要时再点「启动」。", false);
+            } else {
+                setMessage("Repair failed: " + why + (cleanup ? " - see TUN Setup" : ""),
+                           "修复失败：" + why + (cleanup ? "，见 TUN 设置页" : ""), true);
+            }
+            break;
+        }
+        case Op::Kind::CloseConns: {
+            setBusy(Busy::ClosingConns);
+            std::string body;
+            if (op.a == "all") {
+                body = "{\"all\":true}";
+            } else if (op.a.rfind("id:", 0) == 0) {
+                body = "{\"id\":" + jsonString(op.a.substr(3)) + "}";
+            } else if (const size_t colon = op.a.find(':'); colon != std::string::npos && colon > 0) {
+                body = "{\"by\":" + jsonString(op.a.substr(0, colon)) + ",\"key\":" +
+                       jsonString(op.a.substr(colon + 1)) + "}";
+            } else {
+                setMessage("Invalid connection selection", "连接选择无效", true);
+                break;
+            }
+            r = httpRequest(port_, "POST", "/api/connections/close", body, kRefreshTimeoutMs);
+            if (r.ok && r.status == 200) setMessage("Connections closed", "连接已断开", false);
+            else setMessage("Close failed: " + apiErrorText(r), "断开失败：" + apiErrorText(r), true);
+            break;
+        }
+        case Op::Kind::ClearLog: {
+            setBusy(Busy::ClearingLog);
+            r = httpRequest(port_, "POST", "/api/log/clear", "{}", kActionTimeoutMs);
+            if (r.ok && r.status == 200) setMessage("Log cleared", "日志已清空", false);
+            else setMessage("Clear failed: " + apiErrorText(r), "清空失败：" + apiErrorText(r), true);
+            break;
+        }
+        case Op::Kind::LogLevel: {
+            setBusy(Busy::SettingLogLevel);
+            r = httpRequest(port_, "POST", "/api/loglevel", "{\"level\":" + jsonString(op.a) + "}", kActionTimeoutMs);
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (r.ok && r.status == 200) {
+                snap_.logLevel = op.a;
+                logLevelDirty_ = false;
+            } else {
+                logLevelDirty_ = true;
+            }
+            ++snap_.seq;
+            lock.unlock();
+            if (r.ok && r.status == 200)
+                setMessage("Log level: " + op.a + " (reset after restart)", "日志等级：" + op.a + "（重启后恢复）", false);
+            else setMessage("Log level: " + apiErrorText(r), "日志等级：" + apiErrorText(r), true);
             break;
         }
         case Op::Kind::RestartDaemon: {
@@ -389,7 +552,8 @@ void Model::doAction(const Op& op) {
             }
             break;
         }
-        case Op::Kind::Poll: break;
+        case Op::Kind::Poll:
+        case Op::Kind::CheckSetup: break;
     }
     setBusy(Busy::None);
 }

@@ -1,4 +1,4 @@
-// FrameClash panel (0.5.0 layout: sidebar + Overview / Proxies / Profiles): drawing the 1200x700 dashboard panel and its thumbnail, and turning laser clicks into actions.
+// FrameClash panel: the 1200x700 SteamVR dashboard, six sidebar views, and laser hit-testing.
 // Copyright (c) 2026 FrameClash contributors. MIT License.
 #pragma once
 
@@ -30,9 +30,11 @@ struct KeyboardHooks {
     std::function<void()> hide;
     /** Clipboard text ("" + error if none). */
     std::function<std::string(std::string& error)> paste;
+    /** Copy text to the system clipboard. @return "" on success, else why not. */
+    std::function<std::string(const std::string& text)> copy;
 };
 
-enum class View { Overview, Proxies, Profiles };
+enum class View { Overview, Proxies, Connections, Logs, Profiles, Setup };
 
 class PanelUi {
 public:
@@ -54,7 +56,7 @@ public:
     bool showGroup(const std::string& name);
 
     // ---- 0.2.1: Profiles view and text input ----
-    void showView(View view) { view_ = view; }
+    void showView(View view);
     View view() const { return view_; }
     /** Optional: open the stock SteamVR keyboard for a field ("url", "name", "path"). @return false if it can't */
     bool startEdit(const std::string& field);
@@ -96,6 +98,14 @@ private:
     int rowOffset_ = 0;          ///< first node row shown
     bool sortByDelay_ = false;
     int64_t repairArmedAt_ = 0;  ///< "Repair network" waits for a second tap
+    std::string armed_;
+    int64_t armedAt_ = 0;
+    int connsOffset_ = 0, maxConnsOffset_ = 0;
+    std::string connsBy_ = "process", connsKey_;
+    std::string logFilter_ = "all", expandedLog_;
+    bool logsPrev_ = false;
+    int logOffset_ = 0, maxLogOffset_ = 0;
+    std::vector<LogLine> logView_;  ///< the lines last drawn; held still while scrolled up
     double scrollAccum_ = 0;
     std::string hover_;
     std::string pressed_;
@@ -117,6 +127,14 @@ private:
     void drawOverview(const Pen& pen, const Snapshot& s);
     void drawProxies(const Pen& pen, const Snapshot& s);
     void drawRescue(const Pen& pen, const Snapshot& s);
+    void drawConnections(const Pen& pen, const Snapshot& s);
+    void drawLogs(const Pen& pen, const Snapshot& s);
+    void drawSetup(const Pen& pen, const Snapshot& s);
+    bool activateConns(const std::string& id);
+    bool activateLogs(const std::string& id);
+    bool activateSetup(const std::string& id);
+    bool confirmArmed(const std::string& id);
+    bool isArmed(const std::string& id);
     int delayOf(const Snapshot& s, const std::string& name) const;
     // ui_profiles.cpp
     void drawProfilesView(const Pen& pen, const Snapshot& s);

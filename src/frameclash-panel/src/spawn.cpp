@@ -13,12 +13,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 bool inPath(const std::string& name) {
@@ -181,7 +184,209 @@ bool readFrom(const std::string& display, std::string& out, std::string& error) 
     return true;
 }
 
+struct ClipboardAtoms {
+    xcb_atom_t clip, targets, utf8, text, property;
+};
+
+struct ClipboardState {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::thread worker;
+    std::string text, error;
+    uint64_t requestSeq = 0, doneSeq = 0;
+    bool reclaim = false, quit = false, finished = false;
+};
+
+ClipboardState gClipboard;
+
+void setClipboardError(const std::string& error) {
+    std::lock_guard<std::mutex> lock(gClipboard.mutex);
+    gClipboard.error = error;
+}
+
+bool acquireClipboard(xcb_connection_t* c, xcb_window_t win, const ClipboardAtoms& atoms) {
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, atoms.property, XCB_ATOM_STRING, 8, 0, "");
+    xcb_flush(c);
+    bool haveTime = false;
+    xcb_timestamp_t time = XCB_CURRENT_TIME;
+    const int64_t until = nowMs() + 250;
+    while (!haveTime && nowMs() < until && !xcb_connection_has_error(c)) {
+        pollfd p {xcb_get_file_descriptor(c), POLLIN, 0};
+        const int rc = ::poll(&p, 1, static_cast<int>(std::max<int64_t>(1, until - nowMs())));
+        if (rc < 0 && errno == EINTR) continue;
+        while (xcb_generic_event_t* event = xcb_poll_for_event(c)) {
+            if ((event->response_type & 0x7f) == XCB_PROPERTY_NOTIFY) {
+                const auto* property = reinterpret_cast<xcb_property_notify_event_t*>(event);
+                if (property->window == win && property->atom == atoms.property &&
+                    property->state == XCB_PROPERTY_NEW_VALUE) {
+                    time = property->time;
+                    haveTime = true;
+                }
+            }
+            std::free(event);
+        }
+    }
+    if (!haveTime) return false;
+    xcb_set_selection_owner(c, win, atoms.clip, time);  // owner first: atom first is a BadWindow
+    xcb_flush(c);
+    xcb_get_selection_owner_reply_t* owner =
+        xcb_get_selection_owner_reply(c, xcb_get_selection_owner(c, atoms.clip), nullptr);
+    const bool acquired = owner != nullptr && owner->owner == win;
+    std::free(owner);
+    return acquired;
+}
+
+void answerClipboardRequest(xcb_connection_t* c, const xcb_selection_request_event_t& request,
+                            const ClipboardAtoms& atoms, const std::string& text) {
+    xcb_atom_t property = request.property == XCB_NONE ? request.target : request.property;
+    if (request.target == atoms.targets) {
+        const xcb_atom_t targets[] = {atoms.targets, atoms.utf8, XCB_ATOM_STRING, atoms.text};
+        xcb_change_property(c, XCB_PROP_MODE_REPLACE, request.requestor, property, XCB_ATOM_ATOM, 32, 4, targets);
+    } else if (request.target == atoms.utf8 || request.target == XCB_ATOM_STRING || request.target == atoms.text) {
+        xcb_change_property(c, XCB_PROP_MODE_REPLACE, request.requestor, property, atoms.utf8, 8,
+                            static_cast<uint32_t>(text.size()), text.data());
+    } else {
+        property = XCB_NONE;
+    }
+    xcb_selection_notify_event_t notify {};
+    notify.response_type = XCB_SELECTION_NOTIFY;
+    notify.time = request.time;
+    notify.requestor = request.requestor;
+    notify.selection = request.selection;
+    notify.target = request.target;
+    notify.property = property;
+    xcb_send_event(c, 0, request.requestor, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char*>(&notify));
+}
+
+void runClipboardWriter() {
+    struct Finish {
+        ~Finish() {
+            std::lock_guard<std::mutex> lock(gClipboard.mutex);
+            gClipboard.finished = true;
+            gClipboard.wake.notify_all();
+        }
+    } finish;
+    struct Connection {
+        xcb_connection_t* value = nullptr;
+        ~Connection() { if (value != nullptr) xcb_disconnect(value); }
+    } connection;
+    std::string display;
+    for (const std::string& candidate : xDisplays()) {
+        connection.value = xcb_connect(candidate.c_str(), nullptr);
+        if (!xcb_connection_has_error(connection.value)) {
+            display = candidate;
+            break;
+        }
+        xcb_disconnect(connection.value);
+        connection.value = nullptr;
+    }
+    if (connection.value == nullptr) {
+        setClipboardError("no X display found");
+        return;
+    }
+    xcb_connection_t* c = connection.value;
+    const ClipboardAtoms atoms {atom(c, "CLIPBOARD"), atom(c, "TARGETS"), atom(c, "UTF8_STRING"), atom(c, "TEXT"),
+                                atom(c, "FRAMECLASH_CLIPBOARD")};
+    const xcb_window_t win = xcb_generate_id(c);
+    const uint32_t events = XCB_EVENT_MASK_PROPERTY_CHANGE;
+    xcb_create_window(c, XCB_COPY_FROM_PARENT, win, xcb_setup_roots_iterator(xcb_get_setup(c)).data->root, 0, 0, 1,
+                      1, 0, XCB_WINDOW_CLASS_INPUT_ONLY, XCB_COPY_FROM_PARENT, XCB_CW_EVENT_MASK, &events);
+    xcb_flush(c);
+    while (true) {
+        uint64_t seq = 0;
+        {
+            std::lock_guard<std::mutex> lock(gClipboard.mutex);
+            if (gClipboard.quit) return;
+            if (gClipboard.reclaim) {
+                gClipboard.reclaim = false;
+                seq = gClipboard.requestSeq;
+            }
+        }
+        if (seq != 0) {
+            const bool acquired = acquireClipboard(c, win, atoms);
+            size_t bytes = 0;
+            {
+                std::lock_guard<std::mutex> lock(gClipboard.mutex);
+                bytes = gClipboard.text.size();
+                gClipboard.error = acquired ? "" : "could not acquire the X clipboard";
+                if (gClipboard.requestSeq == seq) gClipboard.doneSeq = seq;
+            }
+            gClipboard.wake.notify_all();
+            if (!acquired) return;
+            std::fprintf(stderr, "[clipboard] %s <- %zu bytes\n", display.c_str(), bytes);
+        }
+        pollfd p {xcb_get_file_descriptor(c), POLLIN, 0};
+        const int rc = ::poll(&p, 1, 250);
+        if (rc < 0 && errno == EINTR) continue;
+        while (xcb_generic_event_t* event = xcb_poll_for_event(c)) {
+            const uint8_t type = event->response_type & 0x7f;
+            if (type == XCB_SELECTION_CLEAR) {
+                const auto* clear = reinterpret_cast<xcb_selection_clear_event_t*>(event);
+                if (clear->selection == atoms.clip) {
+                    std::free(event);
+                    return;
+                }
+            } else if (type == XCB_SELECTION_REQUEST) {
+                const auto* request = reinterpret_cast<xcb_selection_request_event_t*>(event);
+                if (request->selection == atoms.clip) {
+                    std::string text;
+                    {
+                        std::lock_guard<std::mutex> lock(gClipboard.mutex);
+                        text = gClipboard.text;
+                    }
+                    answerClipboardRequest(c, *request, atoms, text);
+                }
+            }
+            std::free(event);
+        }
+        xcb_flush(c);
+        if (xcb_connection_has_error(c)) {
+            setClipboardError("X clipboard connection lost");
+            return;
+        }
+    }
+}
+
 }  // namespace
+
+std::string copyToClipboard(const std::string& text) {
+    std::unique_lock<std::mutex> lock(gClipboard.mutex);
+    if (gClipboard.worker.joinable() && gClipboard.finished) {
+        std::thread old = std::move(gClipboard.worker);
+        lock.unlock();
+        old.join();
+        lock.lock();
+    }
+    gClipboard.text = text;
+    gClipboard.error.clear();
+    gClipboard.reclaim = true;
+    const uint64_t seq = ++gClipboard.requestSeq;
+    if (!gClipboard.worker.joinable()) {
+        gClipboard.quit = false;
+        gClipboard.finished = false;
+        gClipboard.worker = std::thread(runClipboardWriter);
+    }
+    gClipboard.wake.notify_all();
+    // ponytail: blocks the frame up to 500 ms; move to the model thread if it shows
+    const bool answered = gClipboard.wake.wait_for(lock, std::chrono::milliseconds(500), [&] {
+        return gClipboard.doneSeq == seq || gClipboard.finished;
+    });
+    if (!answered) return "timed out acquiring the X clipboard";
+    if (gClipboard.doneSeq == seq && gClipboard.error.empty()) return "";
+    if (!gClipboard.error.empty()) return gClipboard.error;
+    return "the X clipboard owner stopped";
+}
+
+void stopClipboard() {
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(gClipboard.mutex);
+        gClipboard.quit = true;
+        gClipboard.wake.notify_all();
+        worker = std::move(gClipboard.worker);
+    }
+    if (worker.joinable()) worker.join();
+}
 
 std::string readClipboard(std::string& error) {
     const auto displays = xDisplays();

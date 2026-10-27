@@ -71,7 +71,8 @@ void usage() {
         "                        [--list-buttons] [--thumb-png OUT.png]   (no SteamVR needed)\n"
         "       frameclash-panel --icon-png SIZE OUT.png\n"
         "steps: start | stop | refresh | test | select:GROUP=NODE | group:NAME | press:ID | click:X,Y | wait:MS\n"
-        "       view:proxy|profiles | set:FIELD=TEXT | edit:FIELD | kbkeys:KEYS | kbdone[:TEXT] | kbclosed\n"
+        "       view:overview|proxies|conns|logs|profiles|setup | set:FIELD=TEXT | edit:FIELD | kbkeys:KEYS\n"
+        "       kbdone[:TEXT] | kbclosed\n"
         "       (FIELD = url, name, path; dump options: --fake-clipboard TEXT --fake-keyboard-error MSG)\n"
         "The API address can also come from FRAMECLASH_UI_ADDR; it must be loopback.\n"
         "Exit codes: 0 SteamVR quit, 3 closed from the dashboard / another instance already running, 1 error.");
@@ -141,6 +142,10 @@ int runDump(const Options& opt) {
         if (opt.fakeClipboard.empty()) error = "clipboard empty";
         return opt.fakeClipboard;
     };
+    hooks.copy = [](const std::string& text) {
+        std::printf("would copy %zu bytes\n", text.size());
+        return std::string();
+    };
     PanelUi ui(
         model, fonts,
         [&] {
@@ -185,7 +190,7 @@ int runDump(const Options& opt) {
                 ui.pointerDown(x, y);
                 ui.pointerUp(x, y);
             }
-        } else if (step.rfind("view:", 0) == 0) {  // view:overview, view:proxies, view:profiles
+        } else if (step.rfind("view:", 0) == 0) {  // any sidebar view:overview / proxies / conns / logs / profiles / setup
             ok = ui.press(step);
         } else if (step.rfind("set:", 0) == 0) {
             const size_t eq = step.find('=');
@@ -315,6 +320,7 @@ int runVr(const Options& opt) {
         };
     hooks.hide = [&] { vr.hideKeyboard(); };
     hooks.paste = [](std::string& error) { return readClipboard(error); };
+    hooks.copy = [](const std::string& text) { return copyToClipboard(text); };
     PanelUi ui(
         model, fonts,
         [&] {
@@ -416,6 +422,7 @@ int runVr(const Options& opt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(visible ? 33 : 250));
     }
     vr.shutdown();
+    stopClipboard();
     cairo_surface_destroy(thumb);
     cairo_surface_destroy(surface);
     if (instanceFd >= 0) ::close(instanceFd);

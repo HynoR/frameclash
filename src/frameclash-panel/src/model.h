@@ -18,8 +18,10 @@ enum class Reach { Unknown, Ok, Unreachable };
 
 enum class Busy {
     None, Starting, Stopping, SwitchingTun, Refreshing, Testing, Selecting, Importing, Activating, Deleting,
-    SwitchingMode, CheckingIp, Repairing, Restarting
+    SwitchingMode, CheckingIp, Repairing, Restarting, ClosingConns, ClearingLog, SettingLogLevel
 };
+
+enum class Detail { None, Conns, Logs, Setup };
 
 struct Snapshot {
     uint64_t seq = 0;                ///< bumps on every change (the UI redraws when it moves)
@@ -29,6 +31,11 @@ struct Snapshot {
     std::map<std::string, ProxyNode> nodes;
     std::vector<std::string> groups;
     ConnSummary conn;
+    ConnList connList;
+    std::vector<LogLine> logLines;
+    std::string logLevel;
+    TunSetup setup;
+    bool needCleanup = false;
     double upSpeed = 0, downSpeed = 0;  ///< bytes/s, from the change in conn totals between polls
     ExitIp exitIp;                   ///< last "Check" result (cleared by anything that changes the route)
     std::string exitIpError;
@@ -55,6 +62,8 @@ public:
     Snapshot snapshot() const;
     /** Ask for a status refresh now. */
     void poll();
+    void checkSetup();
+    void setDetail(Detail detail, std::string a = "", std::string b = "");
     void start();
     void stop();
     void setTun(bool on);
@@ -77,6 +86,9 @@ public:
     /** Use (or refresh) a saved profile. */
     void activateProfile(const std::string& id);
     void deleteProfile(const std::string& id);
+    void closeConns(const std::string& which);
+    void clearLog();
+    void setLogLevel(const std::string& level);
     /** Poll period: fast while the panel is shown, slow when hidden. */
     void setInterval(int ms);
     /** True when nothing is queued or running. */
@@ -86,8 +98,8 @@ public:
 private:
     struct Op {
         enum class Kind {
-            Poll, Start, Stop, Tun, TunDns, Refresh, Select, TestGroup, TestNode, ImportUrl, ImportFile, Activate, Delete,
-            Mode, ExitIp, Repair, RestartDaemon
+            Poll, CheckSetup, Start, Stop, Tun, TunDns, Refresh, Select, TestGroup, TestNode, ImportUrl, ImportFile,
+            Activate, Delete, Mode, ExitIp, Repair, RestartDaemon, CloseConns, ClearLog, LogLevel
         } kind;
         std::string a, b;
     };
@@ -100,6 +112,9 @@ private:
     int intervalMs_ = 2000;
     Snapshot snap_;
     int64_t lastConnAtMs_ = 0;   ///< when snap_.conn was taken (for the speeds)
+    Detail detail_ = Detail::None;
+    std::string detailA_, detailB_;
+    bool logLevelDirty_ = false;
     std::thread thread_;
 
     void push(Op op);

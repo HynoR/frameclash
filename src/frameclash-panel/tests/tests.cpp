@@ -54,6 +54,46 @@ int main() {
     CHECK(parseConn(R"({"connections":3,"upload_total":10,"download_total":2048})", c) && c.connections == 3 &&
           c.download == 2048);
 
+    TunSetup setup;
+    CHECK(parseTunSetup(R"({"script":"~/.local/lib/frameclash/tun-setup.sh","helper":"",
+      "helper_outdated":false,"dns_allowed":false,"self_dns":true,"running":false,"leftovers":["ip -4 rule 9000"],
+      "suggest":"install"})", setup, error));
+    CHECK(setup.have && setup.haveDnsAllowed && !setup.dnsAllowed && setup.selfDns && setup.leftovers.size() == 1 &&
+          setup.suggest == "install");
+    CHECK(parseTunSetup(R"({"script":"x","helper":"","self_dns":false,"running":true,"leftovers":[],"suggest":""})",
+                        setup, error));
+    CHECK(setup.have && !setup.haveDnsAllowed && !setup.selfDns && setup.running);
+    CHECK(!parseTunSetup("[1]", setup, error));
+
+    ConnList list;
+    CHECK(parseConnList(R"({"total":2,"matched":1,"upload_total":100,"download_total":900,"memory":42,"groups":[
+      {"key":"steam","count":2,"upload":30,"download":70,"oldest_s":120}],"connections":[
+      {"id":"abc","network":"tcp","type":"Tun","host":"例子.com","port":443,"process":"steam",
+       "rule":"MATCH","chain":"节点 A","group":"选择","upload":10,"download":20,"age_s":60}]})", list, error));
+    CHECK(list.have && list.total == 2 && list.matched == 1 && list.upTotal == 100 && list.downTotal == 900);
+    CHECK(list.groups.size() == 1 && list.groups[0].key == "steam" && list.groups[0].count == 2 &&
+          list.groups[0].oldestS == 120);
+    CHECK(list.conns.size() == 1 && list.conns[0].id == "abc" && list.conns[0].host == "例子.com" &&
+          list.conns[0].port == 443 && list.conns[0].ageS == 60);
+    CHECK(!parseConnList("bad json", list, error));
+
+    const std::string logText =
+        "time=\"2026-10-27T12:34:56.123+08:00\" level=warning msg=\"无法连接 \\\"节点 A\\\"\"\n"
+        "--- frameclashd 0.6.0: mihomo start 2026-10-27T12:00:00+08:00 (TUN off) ---\n"
+        "not a logfmt line\n"
+        "time=\"2026-10-27T01:02:03Z\" level=info msg=\"完成\"\n";
+    const auto logLines = parseLogLines(logText, 10);
+    CHECK(logLines.size() == 4);
+    CHECK(logLines[0].time == "12:34:56" && logLines[0].level == "warning" &&
+          logLines[0].msg == "无法连接 \"节点 A\"");
+    CHECK(logLines[1].marker);
+    CHECK(logLines[2].msg == "not a logfmt line" && logLines[2].time.empty());
+    CHECK(logLines[3].time == "01:02:03" && logLines[3].msg == "完成");
+    const auto lastTwo = parseLogLines(logText, 2);
+    CHECK(lastTwo.size() == 2 && lastTwo[0].msg == "not a logfmt line" && lastTwo[1].msg == "完成");
+    std::string logLevel;
+    CHECK(parseLogLevel(R"({"level":"warning"})", logLevel) && logLevel == "warning");
+
     HttpResult r;
     r.ok = true;
     r.status = 400;

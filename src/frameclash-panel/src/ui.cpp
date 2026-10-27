@@ -1,5 +1,5 @@
 // Copyright (c) 2026 FrameClash contributors. MIT License.
-// 0.5.0 layout: a sidebar (Overview / Proxies / Profiles, status, language) and cards, like desktop Clash clients.
+// 0.6.0 layout: a sidebar (Overview / Proxies / Connections / Logs / Profiles / TUN Setup) and information-dense cards.
 // Colors: palette.h. The drawing helpers (Pen, fonts, icons, text layout) come from frameeyeosc.
 #include "ui.h"
 
@@ -152,6 +152,9 @@ std::string PanelUi::busyLabel(Busy busy) const {
         case Busy::CheckingIp: return tr("Checking…", "正在检测…");
         case Busy::Repairing: return tr("Repairing the network…", "正在修复网络…");
         case Busy::Restarting: return tr("Restarting frameclashd…", "正在重启后台服务…");
+        case Busy::ClosingConns: return tr("Closing connections…", "正在断开连接…");
+        case Busy::ClearingLog: return tr("Clearing the log…", "正在清空日志…");
+        case Busy::SettingLogLevel: return tr("Setting the log level…", "正在切换日志等级…");
         case Busy::None: break;
     }
     return "";
@@ -165,21 +168,30 @@ void PanelUi::draw(cairo_t* cr, const Snapshot& s) {
     cairo_paint(cr);
     trackImport(s);
     drawSidebar(pen, s);
-    // page title, and what is running right now
-    const std::string title = view_ == View::Overview ? tr("Overview", "概览")
-                              : view_ == View::Proxies ? tr("Proxies", "代理")
-                                                       : tr("Profiles", "配置");
+    std::string title;
+    switch (view_) {
+        case View::Overview: title = tr("Overview", "概览"); break;
+        case View::Proxies: title = tr("Proxies", "代理"); break;
+        case View::Connections: title = tr("Connections", "连接"); break;
+        case View::Logs: title = tr("Logs", "日志"); break;
+        case View::Profiles: title = tr("Profiles", "配置"); break;
+        case View::Setup: title = tr("TUN Setup", "TUN 设置"); break;
+    }
     pen.text(kX0, 52, title, 28, cText, true);
     const std::string busy = busyLabel(s.busy);
     if (!busy.empty()) pen.text(kX1, 50, busy, 17, cAmber, true, true);
-    if (s.reach == Reach::Unreachable && view_ != View::Profiles) {
+    if (s.reach == Reach::Unreachable && view_ != View::Profiles && view_ != View::Setup) {
         drawRescue(pen, s);
-    } else if (view_ == View::Overview) {
-        drawOverview(pen, s);
-    } else if (view_ == View::Proxies) {
-        drawProxies(pen, s);
-    } else {
-        drawProfilesView(pen, s);
+        drawMessage(pen, s, kX0, kFootY, kCW, kFootH);
+        return;
+    }
+    switch (view_) {
+        case View::Overview: drawOverview(pen, s); break;
+        case View::Proxies: drawProxies(pen, s); break;
+        case View::Connections: drawConnections(pen, s); break;
+        case View::Logs: drawLogs(pen, s); break;
+        case View::Profiles: drawProfilesView(pen, s); break;
+        case View::Setup: drawSetup(pen, s); break;
     }
     drawMessage(pen, s, kX0, kFootY, kCW, kFootH);
 }
@@ -202,7 +214,11 @@ void PanelUi::drawSidebar(const Pen& pen, const Snapshot& s) {
         std::string label;
     } items[] = {{View::Overview, "view:overview", tr("Overview", "概览")},
                  {View::Proxies, "view:proxies", tr("Proxies", "代理")},
-                 {View::Profiles, "view:profiles", tr("Profiles", "配置")}};
+                 {View::Connections, "view:conns", tr("Connections", "连接")},
+                 {View::Logs, "view:logs", tr("Logs", "日志")},
+                 {View::Profiles, "view:profiles", tr("Profiles", "配置")},
+                 {View::Setup, "view:setup", tr("TUN Setup", "TUN 设置")}};
+    const bool setupAttention = !s.status.tunReady.empty() || s.status.tunDns == "no-permission" || s.needCleanup;
     double y = 92;
     for (const auto& it : items) {
         const bool sel = view_ == it.v;
@@ -218,6 +234,7 @@ void PanelUi::drawSidebar(const Pen& pen, const Snapshot& s) {
             cairo_fill(pen.cr);
         }
         pen.text(32, y + 33, it.label, 20, sel ? cAmber : cText, sel);
+        if (it.v == View::Setup && setupAttention) pen.dot(158, y + 25, cAmber);
         addHit(it.id, 12, y, kSideW - 24, 50, true);
         y += 58;
     }
@@ -233,7 +250,13 @@ void PanelUi::drawSidebar(const Pen& pen, const Snapshot& s) {
     pen.color(c);
     cairo_fill(pen.cr);
     pen.text(44, 580, state, 18, s.reach == Reach::Ok && s.status.running ? cText : c, true);
-    button(pen, "lang", 12, 600, kSideW - 24, 42, zh_ ? "English" : "中文", true, cCtl, cText, 17);
+    // a two-way switch: the current language is the lit half
+    pen.color(cCtl);
+    pen.roundedRect(12, 600, kSideW - 24, 42, 8);
+    cairo_fill(pen.cr);
+    const double half = (kSideW - 24 - 8) / 2;
+    button(pen, "lang:zh", 16, 604, half, 34, "中文", true, zh_ ? cAmberTint : cCtl, zh_ ? cAmber : cMuted, 16);
+    button(pen, "lang:en", 20 + half, 604, half, 34, "EN", true, zh_ ? cCtl : cAmberTint, zh_ ? cMuted : cAmber, 16);
     if (!s.status.version.empty()) pen.text(22, 674, "v" + s.status.version, 14, cMuted);
 }
 
@@ -285,12 +308,14 @@ void PanelUi::drawOverview(const Pen& pen, const Snapshot& s) {
                      running ? cText : cDim, true);
             pen.text(x, y + 114, cols[i].label, 15, cMuted);
         }
-        if (running && s.conn.have)
+        if (running && s.conn.have) {
             pen.text(x2 + 20, y + 148,
                      tr("Total ", "累计 ") + "↑ " + humanBytes(static_cast<double>(s.conn.upload)) + "  ↓ " +
                          humanBytes(static_cast<double>(s.conn.download)) + "  ·  " +
                          std::to_string(s.conn.connections) + tr(" connections", " 个连接"),
                      15, cMuted);
+            addHit("view:conns", x2 + 12, y + 128, halfW - 24, 34, true);
+        }
     }
 
     // ---- row 2: TUN | DNS | mode ----
@@ -305,12 +330,14 @@ void PanelUi::drawOverview(const Pen& pen, const Snapshot& s) {
     };
     {
         const double x = kX0;
-        card(pen, x, y, thirdW, 140, tr("TUN", "虚拟网卡 TUN"), "tun");
-        toggle(pen, x + thirdW - 80, y + 16, s.status.tun, idle);
+        const bool needsSetup = !s.status.tunReady.empty() && !s.status.tun;
+        const std::string hit = needsSetup ? "view:setup" : "tun";
+        card(pen, x, y, thirdW, 140, tr("TUN", "虚拟网卡 TUN"), hit);
+        toggle(pen, x + thirdW - 80, y + 16, s.status.tun, idle && !needsSetup);
         std::string d;
         Color c = cMuted;
-        if (!s.status.tunReady.empty() && !s.status.tun) {
-            d = tr("Not set up: run tun-setup.sh install once (sudo)", "未安装：先运行一次 tun-setup.sh install（sudo）");
+        if (needsSetup) {
+            d = tr("Not set up: tap to configure", "未安装：点此设置");
             c = cAmber;
         } else if (s.status.tun) {
             d = tr("All wlan0 traffic via the proxy; streaming Wi-Fi and LAN stay direct",
@@ -319,25 +346,27 @@ void PanelUi::drawOverview(const Pen& pen, const Snapshot& s) {
             d = tr("Off: only apps using the system proxy", "关闭：仅使用系统代理的应用走代理");
         }
         desc(x, d, c);
-        addHit("tun", x, y, thirdW, 140, idle);
+        addHit(hit, x, y, thirdW, 140, needsSetup || idle);
     }
     {
         const double x = kX0 + thirdW + kGap;
         const bool tunUp = running && s.status.tun;
+        const bool noPermission = tunUp && s.status.tunDns == "no-permission";
+        const std::string hit = noPermission ? "view:setup" : "tundns";
         const bool on = tunUp ? s.status.tunDns == "on" : s.status.selfDns;
-        card(pen, x, y, thirdW, 140, tr("DNS", "DNS 接管"), "tundns");
-        toggle(pen, x + thirdW - 80, y + 16, on, idle);
+        card(pen, x, y, thirdW, 140, tr("DNS", "DNS 接管"), hit);
+        toggle(pen, x + thirdW - 80, y + 16, on, idle && !noPermission);
         std::string d;
         Color c = cMuted;
         if (!tunUp) d = tr("Applies while TUN runs: system DNS through the tun", "TUN 运行时生效：系统 DNS 走 TUN");
         else if (s.status.tunDns == "on") d = tr("System DNS goes through the tun", "系统 DNS 走 TUN");
         else if (s.status.tunDns == "off") d = tr("System DNS as the network set it", "使用网络自带的 DNS");
-        else if (s.status.tunDns == "no-permission")
-            d = tr("No permission: run tun-setup.sh install", "无权限：需运行 tun-setup.sh install"), c = cAmber;
+        else if (noPermission)
+            d = tr("No permission: tap to repair", "无权限：点此修复"), c = cAmber;
         else if (s.status.tunDns.empty()) d = tr("Setting up…", "正在设置…");
         else d = s.status.tunDns, c = cRed;
         desc(x, d, c);
-        addHit("tundns", x, y, thirdW, 140, idle);
+        addHit(hit, x, y, thirdW, 140, noPermission || idle);
     }
     {
         const double x = kX0 + 2 * (thirdW + kGap);
@@ -607,11 +636,20 @@ bool PanelUi::pointerLeave() {
 }
 
 bool PanelUi::scroll(double dy) {
-    // the list under the pointer scrolls: profiles, the group list, or the node grid
     int* offset = &rowOffset_;
     int maxOff = maxRowOffset_;
     double step = kCellStep;
-    if (view_ == View::Profiles) {
+    bool newestAtZero = false;
+    if (view_ == View::Logs) {
+        offset = &logOffset_;
+        maxOff = maxLogOffset_;
+        step = 22;
+        newestAtZero = true;
+    } else if (view_ == View::Connections) {
+        offset = &connsOffset_;
+        maxOff = maxConnsOffset_;
+        step = 54;
+    } else if (view_ == View::Profiles) {
         offset = &profOffset_;
         maxOff = std::max(0, static_cast<int>(last_.profiles.profiles.size()) - 5);
         step = 76;
@@ -626,11 +664,19 @@ bool PanelUi::scroll(double dy) {
     bool changed = false;
     while (scrollAccum_ >= step) {
         scrollAccum_ -= step;
-        if (*offset < maxOff) ++*offset, changed = true;
+        if (newestAtZero) {
+            if (*offset > 0) --*offset, changed = true;
+        } else if (*offset < maxOff) {
+            ++*offset, changed = true;
+        }
     }
     while (scrollAccum_ <= -step) {
         scrollAccum_ += step;
-        if (*offset > 0) --*offset, changed = true;
+        if (newestAtZero) {
+            if (*offset < maxOff) ++*offset, changed = true;
+        } else if (*offset > 0) {
+            --*offset, changed = true;
+        }
     }
     return changed;
 }
@@ -644,10 +690,20 @@ bool PanelUi::press(const std::string& id) {
     return false;
 }
 
+void PanelUi::showView(View view) {
+    view_ = view;
+    switch (view_) {
+        case View::Connections: model_.setDetail(Detail::Conns, connsBy_, connsKey_); break;
+        case View::Logs: model_.setDetail(Detail::Logs, logsPrev_ ? "prev" : ""); break;
+        case View::Setup: model_.setDetail(Detail::Setup); break;
+        default: model_.setDetail(Detail::None); break;
+    }
+}
+
 bool PanelUi::showGroup(const std::string& name) {
     for (size_t i = 0; i < last_.groups.size(); ++i)
         if (last_.groups[i] == name) {
-            view_ = View::Proxies;
+            showView(View::Proxies);
             group_ = name;
             rowOffset_ = 0;
             const int gi = static_cast<int>(i);
@@ -659,12 +715,18 @@ bool PanelUi::showGroup(const std::string& name) {
 
 void PanelUi::activate(const std::string& id) {
     if (id == "view:overview") {
-        view_ = View::Overview;
+        showView(View::Overview);
     } else if (id == "view:proxies") {
-        view_ = View::Proxies;
+        showView(View::Proxies);
+    } else if (id == "view:conns") {
+        showView(View::Connections);
+    } else if (id == "view:logs") {
+        showView(View::Logs);
     } else if (id == "view:profiles") {
-        view_ = View::Profiles;
-    } else if (activateProfiles(id)) {
+        showView(View::Profiles);
+    } else if (id == "view:setup") {
+        showView(View::Setup);
+    } else if (activateConns(id) || activateLogs(id) || activateSetup(id) || activateProfiles(id)) {
     } else if (id == "toggle") {
         if (last_.status.running) model_.stop();
         else model_.start();
@@ -690,8 +752,8 @@ void PanelUi::activate(const std::string& id) {
         model_.testNode(id.substr(9));
     } else if (id == "settings") {
         if (openSettings_) openSettings_();
-    } else if (id == "lang") {
-        zh_ = !zh_;
+    } else if (id == "lang:zh" || id == "lang:en") {
+        zh_ = id == "lang:zh";
     } else if (id == "test") {
         model_.testGroup(group_);
     } else if (id == "sort") {

@@ -13,9 +13,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,6 +34,14 @@ usage: frameclash COMMAND [ARGS]
                                  setup stays, the proxy stays off until you start it
   tun dns on|off                 TUN: point the system DNS (systemd-resolved) into the tun (default on), or
                                  leave it as the network set it (web/QUIC are still routed by domain)
+  tun setup                      check the TUN helper, DNS permission and leftovers; print the suggested command
+  conns [--by process|host|rule|chain|none] [--key K] [-n N]
+                                 list connection groups (default process), or details with --by none / --key
+  conns close all | ID | --by process|host|rule|chain --key K
+                                 close every connection, one ID, or one group
+  log [--prev] [-n BYTES]        read the current or previous mihomo log tail (default 16000 bytes)
+  log clear                      truncate the current log and remove the previous one
+  log level [LEVEL]              show or temporarily set debug|info|warning|error|silent (not saved)
   mode rule|global|direct        outbound mode (saved; applied without a restart)
   exit-ip                        check where proxied traffic leaves to the internet (asks ipinfo.io)
   import-url URL [--name NAME]   import a subscription (URL "-" = read it from stdin, keeps it out of
@@ -49,6 +59,7 @@ usage: frameclash COMMAND [ARGS]
   version
 
 The daemon address comes from FRAMECLASH_UI_ADDR (default 127.0.0.1:7899) and must be loopback.
+Follow the log in a terminal: tail -f ~/.local/share/frameclash/mihomo.log
 Over SSH: ssh steamos@HOST ~/.local/bin/frameclash status
 `
 
@@ -98,6 +109,10 @@ func (c *cliClient) call(path string, in any, out any) error {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	if out != nil {
+		if text, ok := out.(*string); ok {
+			*text = string(body)
+			return nil
+		}
 		return json.Unmarshal(body, out)
 	}
 	return nil
@@ -188,6 +203,9 @@ func (c *cliClient) run(cmd string, args []string) error {
 		fmt.Println("Proxy stopped.")
 		return nil
 	case "tun":
+		if len(args) == 1 && args[0] == "setup" {
+			return c.tunSetup()
+		}
 		if len(args) == 2 && args[0] == "dns" && (args[1] == "on" || args[1] == "off") {
 			if err := c.call("/api/tun/dns", map[string]bool{"enable": args[1] == "on"}, nil); err != nil {
 				return err
@@ -197,13 +215,20 @@ func (c *cliClient) run(cmd string, args []string) error {
 			return c.status()
 		}
 		if len(args) != 1 || (args[0] != "on" && args[0] != "off") {
-			return usageError{"tun needs on, off or dns on|off"}
+			return usageError{"tun needs on, off, setup or dns on|off"}
 		}
 		if err := c.call("/api/tun", map[string]bool{"enable": args[0] == "on"}, nil); err != nil {
 			return err
 		}
 		fmt.Printf("TUN %s.\n", args[0])
 		return c.status()
+	case "conns":
+		if len(args) > 0 && args[0] == "close" {
+			return c.closeConns(args[1:])
+		}
+		return c.conns(args)
+	case "log":
+		return c.log(args)
 	case "mode":
 		if len(args) != 1 {
 			return usageError{"mode needs rule, global or direct"}
@@ -632,4 +657,299 @@ func shortTime(t string) string {
 		return tt.Local().Format("2006-01-02 15:04")
 	}
 	return t
+}
+
+func (c *cliClient) tunSetup() error {
+	var out struct {
+		Script         string   `json:"script"`
+		Helper         string   `json:"helper"`
+		HelperOutdated bool     `json:"helper_outdated"`
+		DNSAllowed     *bool    `json:"dns_allowed"`
+		SelfDNS        bool     `json:"self_dns"`
+		Running        bool     `json:"running"`
+		Leftovers      []string `json:"leftovers"`
+		Suggest        string   `json:"suggest"`
+	}
+	if err := c.call("/api/tun/setup", nil, &out); err != nil {
+		return err
+	}
+	helper := out.Helper
+	if helper == "" {
+		helper = "ready"
+		if out.HelperOutdated {
+			helper = "outdated (the bundled and installed mihomo sizes differ)"
+		}
+	}
+	dns := "not used (self DNS is off)"
+	if out.SelfDNS {
+		switch {
+		case out.DNSAllowed == nil:
+			dns = "unknown (pkcheck not found)"
+		case *out.DNSAllowed:
+			dns = "allowed"
+		default:
+			dns = "missing (run tun-setup.sh install)"
+		}
+	}
+	leftovers := "none"
+	if out.Running {
+		leftovers = "not checked while mihomo is running"
+	} else if len(out.Leftovers) > 0 {
+		leftovers = strings.Join(out.Leftovers, ", ")
+	}
+	fmt.Printf("Helper:    %s\nDNS:       %s\nLeftovers: %s\n", helper, dns, leftovers)
+	switch out.Suggest {
+	case "install", "cleanup":
+		fmt.Printf("Suggested: %s %s\n", out.Script, out.Suggest)
+	case "repair":
+		cli := filepath.Join(filepath.Dir(out.Script), "..", "..", "bin", "frameclash")
+		fmt.Printf("Suggested: %s repair\n", cli)
+	default:
+		fmt.Println("Suggested: no action needed")
+	}
+	return nil
+}
+
+type cliConnOptions struct {
+	by, key, target string
+	limit           int
+}
+
+func parseCliConnOptions(args []string, closing bool) (cliConnOptions, error) {
+	opts := cliConnOptions{by: "process", limit: 50}
+	rest := []string{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--by" || a == "--key" || a == "-n" || a == "--limit":
+			if i+1 >= len(args) {
+				return opts, usageError{a + " needs a value"}
+			}
+			i++
+			value := args[i]
+			switch a {
+			case "--by":
+				opts.by = value
+			case "--key":
+				opts.key = value
+			default:
+				n, err := strconv.Atoi(value)
+				if err != nil || n < 1 {
+					return opts, usageError{"-n needs a positive integer"}
+				}
+				opts.limit = n
+			}
+		case strings.HasPrefix(a, "--by="):
+			opts.by = strings.TrimPrefix(a, "--by=")
+		case strings.HasPrefix(a, "--key="):
+			opts.key = strings.TrimPrefix(a, "--key=")
+		case strings.HasPrefix(a, "-n="):
+			n, err := strconv.Atoi(strings.TrimPrefix(a, "-n="))
+			if err != nil || n < 1 {
+				return opts, usageError{"-n needs a positive integer"}
+			}
+			opts.limit = n
+		case strings.HasPrefix(a, "-"):
+			return opts, usageError{"unknown conns option " + a}
+		default:
+			rest = append(rest, a)
+		}
+	}
+	if !validConnBy(opts.by, true) {
+		return opts, usageError{"--by must be process, host, rule, chain or none"}
+	}
+	if opts.by == "none" && opts.key != "" {
+		return opts, usageError{"--by none cannot be combined with --key"}
+	}
+	if !closing {
+		if len(rest) != 0 {
+			return opts, usageError{"conns takes options only (or: conns close ...)"}
+		}
+		return opts, nil
+	}
+	if len(rest) > 1 || len(rest) == 1 && opts.key != "" {
+		return opts, usageError{"conns close needs all, one ID, or --by TYPE --key VALUE"}
+	}
+	if len(rest) == 1 {
+		opts.target = rest[0]
+	}
+	if opts.target == "" && opts.key == "" {
+		return opts, usageError{"conns close needs all, one ID, or --by TYPE --key VALUE"}
+	}
+	return opts, nil
+}
+
+func cliBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	value := float64(n)
+	units := []string{"KB", "MB", "GB", "TB"}
+	i := -1
+	for value >= unit && i < len(units)-1 {
+		value /= unit
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", value, units[i])
+}
+
+func cliAge(seconds int64) string {
+	switch {
+	case seconds < 60:
+		return fmt.Sprintf("%ds", seconds)
+	case seconds < 3600:
+		return fmt.Sprintf("%dm", seconds/60)
+	case seconds < 86400:
+		return fmt.Sprintf("%dh%02dm", seconds/3600, seconds%3600/60)
+	default:
+		return fmt.Sprintf("%dd%02dh", seconds/86400, seconds%86400/3600)
+	}
+}
+
+func (c *cliClient) conns(args []string) error {
+	opts, err := parseCliConnOptions(args, false)
+	if err != nil {
+		return err
+	}
+	query := url.Values{}
+	query.Set("by", opts.by)
+	query.Set("limit", strconv.Itoa(opts.limit))
+	if opts.key != "" {
+		query.Set("key", opts.key)
+	}
+	var out struct {
+		Total         int         `json:"total"`
+		Matched       *int        `json:"matched"`
+		UploadTotal   int64       `json:"upload_total"`
+		DownloadTotal int64       `json:"download_total"`
+		Groups        []connGroup `json:"groups"`
+		Connections   []connEntry `json:"connections"`
+	}
+	if err := c.call("/api/connections?"+query.Encode(), nil, &out); err != nil {
+		return err
+	}
+	fmt.Printf("%d connections · ↑ %s ↓ %s\n", out.Total, cliBytes(out.UploadTotal), cliBytes(out.DownloadTotal))
+	if out.Matched != nil && opts.key != "" {
+		fmt.Printf("%d in %s %s\n", *out.Matched, opts.by, opts.key)
+	}
+	if opts.by != "none" && opts.key == "" {
+		fmt.Printf("%8s %10s %12s %12s  %s\n", "COUNT", "OLDEST", "UP", "DOWN", "KEY")
+		for _, group := range out.Groups {
+			fmt.Printf("%8d %10s %12s %12s  %s\n", group.Count, cliAge(group.OldestS), cliBytes(group.Upload),
+				cliBytes(group.Download), group.Key)
+		}
+		return nil
+	}
+	for _, entry := range out.Connections {
+		process := entry.Process
+		if process == "" {
+			process = "?"
+		}
+		hostPort := entry.Host + ":" + strconv.Itoa(entry.Port)
+		if strings.Contains(entry.Host, ":") {
+			hostPort = "[" + entry.Host + "]:" + strconv.Itoa(entry.Port)
+		}
+		fmt.Printf("%-9s %s/%s %s · %s\n", cliAge(entry.AgeS), entry.Network, entry.Type, hostPort, process)
+		fmt.Printf("  %s → %s/%s · ↑ %s ↓ %s · id %s\n", entry.Rule, entry.Group, entry.Chain,
+			cliBytes(entry.Upload), cliBytes(entry.Download), entry.ID)
+	}
+	return nil
+}
+
+func (c *cliClient) closeConns(args []string) error {
+	opts, err := parseCliConnOptions(args, true)
+	if err != nil {
+		return err
+	}
+	var body any
+	switch {
+	case opts.target == "all":
+		body = map[string]bool{"all": true}
+	case opts.target != "":
+		body = map[string]string{"id": opts.target}
+	default:
+		if opts.by == "none" {
+			return usageError{"closing a group needs process, host, rule or chain"}
+		}
+		body = map[string]string{"by": opts.by, "key": opts.key}
+	}
+	var out struct {
+		Closed int `json:"closed"`
+	}
+	if err := c.call("/api/connections/close", body, &out); err != nil {
+		return err
+	}
+	fmt.Printf("Closed %d connections.\n", out.Closed)
+	return nil
+}
+
+func (c *cliClient) log(args []string) error {
+	if len(args) > 0 && args[0] == "clear" {
+		if len(args) != 1 {
+			return usageError{"log clear takes no arguments"}
+		}
+		if err := c.call("/api/log/clear", struct{}{}, nil); err != nil {
+			return err
+		}
+		fmt.Println("Log cleared; the previous log was removed.")
+		return nil
+	}
+	if len(args) > 0 && args[0] == "level" {
+		if len(args) > 2 {
+			return usageError{"log level [debug|info|warning|error|silent]"}
+		}
+		var out struct {
+			Level string `json:"level"`
+		}
+		if len(args) == 1 {
+			if err := c.call("/api/loglevel", nil, &out); err != nil {
+				return err
+			}
+			fmt.Println(out.Level)
+			return nil
+		}
+		if err := c.call("/api/loglevel", map[string]string{"level": args[1]}, nil); err != nil {
+			return err
+		}
+		fmt.Printf("Log level: %s (temporary; restart restores the profile setting).\n", args[1])
+		return nil
+	}
+	prev := false
+	n := 16000
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--prev":
+			prev = true
+		case args[i] == "-n":
+			if i+1 >= len(args) {
+				return usageError{"-n needs a byte count"}
+			}
+			i++
+			parsed, err := strconv.Atoi(args[i])
+			if err != nil || parsed < 1 {
+				return usageError{"-n needs a positive byte count"}
+			}
+			n = parsed
+		case strings.HasPrefix(args[i], "-n="):
+			parsed, err := strconv.Atoi(strings.TrimPrefix(args[i], "-n="))
+			if err != nil || parsed < 1 {
+				return usageError{"-n needs a positive byte count"}
+			}
+			n = parsed
+		default:
+			return usageError{"log [--prev] [-n BYTES] | log clear | log level [LEVEL]"}
+		}
+	}
+	query := url.Values{}
+	query.Set("bytes", strconv.Itoa(n))
+	if prev {
+		query.Set("prev", "1")
+	}
+	var text string
+	if err := c.call("/api/log?"+query.Encode(), nil, &text); err != nil {
+		return err
+	}
+	fmt.Print(text)
+	return nil
 }

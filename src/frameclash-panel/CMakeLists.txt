@@ -1,7 +1,7 @@
 # frameclash-panel: SteamVR dashboard panel for FrameClash. MIT License (see LICENSE, THIRD_PARTY_NOTICES.md
 # at the repository root).
 cmake_minimum_required(VERSION 3.16)
-project(frameclash-panel VERSION 0.5.0 LANGUAGES CXX)
+project(frameclash-panel VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,6 +43,8 @@ add_executable(frameclash-panel
   src/model.cpp
   src/ui.cpp
   src/ui_profiles.cpp
+  src/ui_conns.cpp
+  src/ui_setup.cpp
   src/spawn.cpp
   src/vr_overlay.cpp
   src/third_party_frameeyeosc/draw.cpp
@@ -66,6 +68,6 @@ set_target_properties(frameclash-panel PROPERTIES
 
 add_executable(frameclash-panel-tests tests/tests.cpp src/api.cpp src/spawn.cpp src/third_party_frameeyeosc/json.cpp)
 target_include_directories(frameclash-panel-tests PRIVATE src src/third_party_frameeyeosc)
-target_link_libraries(frameclash-panel-tests PRIVATE PkgConfig::XCB)
+target_link_libraries(frameclash-panel-tests PRIVATE PkgConfig::XCB Threads::Threads)
 enable_testing()
 add_test(NAME unit COMMAND frameclash-panel-tests)

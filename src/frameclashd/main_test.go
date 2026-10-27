@@ -1,10 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json/v2"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -118,5 +125,235 @@ func TestRenderMode(t *testing.T) {
 	a.state.Mode = "direct"
 	if out, _ := a.render(src); !strings.Contains(string(out), "mode: direct") {
 		t.Errorf("mode direct:\n%s", out)
+	}
+}
+
+func TestOpenLogAppendAndClear(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mihomo.log")
+	f, err := openLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("before\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("after\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || string(content) != "after\n" || bytes.Contains(content, []byte{0}) {
+		t.Fatalf("append after truncate = %q, %v", content, err)
+	}
+	f, err = openLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(bytes.Repeat([]byte("x"), logRotateBytes+1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".prev", []byte("stale"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, err = openLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("new start\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	prev, err := os.Stat(path + ".prev")
+	if err != nil || prev.Size() <= logRotateBytes {
+		t.Fatalf("rotated previous log = %+v, %v", prev, err)
+	}
+	content, err = os.ReadFile(path)
+	if err != nil || string(content) != "new start\n" {
+		t.Fatalf("new log = %q, %v", content, err)
+	}
+}
+
+func TestTailFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mihomo.log")
+	content := []byte("first\nsecond\nthird\n")
+	if err := os.WriteFile(path, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	tail, err := tailFile(path, int64(len("third\n")+3))
+	if err != nil || string(tail) != "third\n" {
+		t.Fatalf("tail from a partial line = %q, %v", tail, err)
+	}
+	tail, err = tailFile(path, int64(len(content)+10))
+	if err != nil || !bytes.Equal(tail, content) {
+		t.Fatalf("short file = %q, %v", tail, err)
+	}
+}
+
+func TestTunSuggest(t *testing.T) {
+	tests := []struct {
+		name     string
+		helper   string
+		outdated bool
+		selfDNS  bool
+		allowed  *bool
+		left     []string
+		want     string
+	}{
+		{name: "missing helper", helper: "missing", selfDNS: true, want: "install"},
+		{name: "outdated helper", outdated: true, selfDNS: true, want: "install"},
+		{name: "DNS denied", selfDNS: true, allowed: new(false), want: "install"},
+		{name: "repair leftovers", selfDNS: true, allowed: new(true), left: []string{"rule"}, want: "repair"},
+		{name: "cleanup without helper", helper: "missing", left: []string{"rule"}, want: "cleanup"},
+		{name: "DNS not used", allowed: new(false), want: ""},
+		{name: "unknown DNS permission", selfDNS: true, want: ""},
+		{name: "ready", selfDNS: true, allowed: new(true), want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tunSuggest(tt.helper, tt.outdated, tt.selfDNS, tt.allowed, tt.left); got != tt.want {
+				t.Errorf("tunSuggest = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTunSetupScript(t *testing.T) {
+	home := "/home/steamos"
+	if got := tunSetupScript(home, home+"/.local/lib/frameclash/mihomo"); got != "~/.local/lib/frameclash/tun-setup.sh" {
+		t.Errorf("script = %q", got)
+	}
+	if got := tunSetupScript(home, "/opt/frameclash/mihomo"); got != "/opt/frameclash/tun-setup.sh" {
+		t.Errorf("external script = %q", got)
+	}
+}
+
+const testConnsJSON = `{
+  "downloadTotal": 300, "uploadTotal": 100, "memory": 42,
+  "connections": [
+    {"id":"a","upload":1,"download":10,"start":"2026-10-27T10:00:00Z","chains":["node-a","select"],
+     "rule":"DOMAIN-SUFFIX","rulePayload":"example.com","metadata":{"network":"tcp","type":"Tun","host":"",
+     "sniffHost":"sniff.example","destinationIP":"192.0.2.1","destinationPort":"443","process":"steam"}},
+    {"id":"b","upload":2,"download":20,"start":"2026-10-27T10:01:00Z","chains":["DIRECT","DIRECT"],
+     "rule":"MATCH","rulePayload":"","metadata":{"network":"udp","type":"HTTP","host":"","sniffHost":"",
+     "destinationIP":"192.0.2.2","destinationPort":"53","process":""}},
+    {"id":"c","upload":3,"download":30,"start":"2026-10-27T10:02:00Z","chains":["node-c","select"],
+     "rule":"MATCH","rulePayload":"","metadata":{"network":"tcp","type":"Socks","host":"host.example",
+     "sniffHost":"ignored.example","destinationIP":"192.0.2.3","destinationPort":"8443","process":"steam"}}
+  ]
+}`
+
+func TestGroupConns(t *testing.T) {
+	var in connsResp
+	if err := json.Unmarshal([]byte(testConnsJSON), &in); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 27, 10, 3, 0, 0, time.UTC)
+	groups := groupConns(in.Connections, "process", now)
+	if len(groups) != 2 || groups[0].Key != "steam" || groups[0].Count != 2 || groups[0].OldestS != 180 ||
+		groups[0].Upload != 4 || groups[1].Key != "?" {
+		t.Fatalf("process groups = %+v", groups)
+	}
+	hosts := groupConns(in.Connections, "host", now)
+	seen := map[string]bool{}
+	for _, group := range hosts {
+		seen[group.Key] = true
+	}
+	if len(hosts) != 3 || !seen["sniff.example"] || !seen["192.0.2.2"] || !seen["host.example"] || seen["ignored.example"] {
+		t.Fatalf("host fallback groups = %+v", hosts)
+	}
+	if got := connKey(in.Connections[0], "rule"); got != "DOMAIN-SUFFIX,example.com" {
+		t.Errorf("rule key = %q", got)
+	}
+	entries := listConns(in.Connections, "process", "steam", now)
+	if len(entries) != 2 || entries[0].ID != "c" || entries[1].ID != "a" || entries[0].AgeS != 60 ||
+		entries[0].Chain != "node-c" || entries[0].Group != "select" || entries[0].Port != 8443 {
+		t.Fatalf("connection details = %+v", entries)
+	}
+	for raw, want := range map[string]int{"2": 2, "500": 200} {
+		r := httptest.NewRequest(http.MethodGet, "/api/connections?limit="+raw, nil)
+		got, err := connLimit(r)
+		if err != nil || got != want {
+			t.Errorf("limit %s = %d, %v; want %d", raw, got, err, want)
+		}
+	}
+}
+
+func TestCloseConnsByGroup(t *testing.T) {
+	deleted := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer s" {
+			t.Errorf("authorization header = %q", r.Header.Get("Authorization"))
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/connections":
+			_, _ = w.Write([]byte(testConnsJSON))
+		case r.Method == http.MethodDelete:
+			deleted = append(deleted, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	a := &App{ctlPort: server.Listener.Addr().(*net.TCPAddr).Port, secret: "s"}
+	req := httptest.NewRequest(http.MethodPost, "/api/connections/close",
+		strings.NewReader(`{"by":"process","key":"steam"}`))
+	response := httptest.NewRecorder()
+	a.hCloseConns(response, req)
+	var out struct {
+		OK     bool `json:"ok"`
+		Closed int  `json:"closed"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || !out.OK || out.Closed != 2 {
+		t.Fatalf("close response = %d %s", response.Code, response.Body.String())
+	}
+	if want := []string{"/connections/a", "/connections/c"}; !slices.Equal(deleted, want) {
+		t.Errorf("DELETE paths = %v, want %v", deleted, want)
+	}
+}
+
+func TestParseCliConnOptions(t *testing.T) {
+	opts, err := parseCliConnOptions(nil, false)
+	if err != nil || opts.by != "process" || opts.limit != 50 {
+		t.Fatalf("defaults = %+v, %v", opts, err)
+	}
+	opts, err = parseCliConnOptions([]string{"--by", "host", "--key=example.com", "-n", "20"}, false)
+	if err != nil || opts.by != "host" || opts.key != "example.com" || opts.limit != 20 {
+		t.Fatalf("detail options = %+v, %v", opts, err)
+	}
+	opts, err = parseCliConnOptions([]string{"--by", "process", "--key", "steam"}, true)
+	if err != nil || opts.key != "steam" || opts.target != "" {
+		t.Fatalf("close group options = %+v, %v", opts, err)
+	}
+	opts, err = parseCliConnOptions([]string{"all"}, true)
+	if err != nil || opts.target != "all" {
+		t.Fatalf("close all options = %+v, %v", opts, err)
+	}
+	if _, err := parseCliConnOptions([]string{"--by", "none", "--key", "x"}, false); err == nil {
+		t.Error("accepted --by none with --key")
+	}
+	if _, err := parseCliConnOptions([]string{"--by", "invalid"}, false); err == nil {
+		t.Error("accepted an invalid group")
+	}
+}
+
+func TestRenderLogLevelSilent(t *testing.T) {
+	a := &App{cfgDir: t.TempDir(), mixedPort: 7890, ctlPort: 9090, secret: "s"}
+	out, err := a.render([]byte("proxies: []\nlog-level: info\n"))
+	if err != nil || !strings.Contains(string(out), "log-level: silent") {
+		t.Fatalf("profile log-level not silenced: %v\n%s", err, out)
 	}
 }
