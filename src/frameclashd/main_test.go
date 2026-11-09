@@ -38,7 +38,7 @@ func TestRenderTun(t *testing.T) {
 	if tun["enable"] != true || tun["auto-redirect"] != false || tun["exclude-interface"].([]any)[0] != "wlanap" {
 		t.Errorf("tun = %v", tun)
 	}
-	if dns["enable"] != true || dns["listen"] != nil { // :53 needs privileges: dropped
+	if dns["enable"] != true || dns["listen"] != nil || dns["fake-ip-range"] != tunFakeIPRange { // :53 needs privileges: dropped
 		t.Errorf("dns = %v", dns)
 	}
 	// a high listen port is kept, on loopback (profiles resolve their nodes through it)

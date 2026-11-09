@@ -32,7 +32,8 @@ const (
 	tunDevice          = "frameclash0"
 	tunTable           = 2022
 	tunRuleIndex       = 9000
-	tunDNSServer       = "198.18.0.2" // inside the tun's /30: dns-hijack answers it
+	tunFakeIPRange     = "198.18.0.2/16" // mihomo gives the tun this address as a /30: 198.18.0.2/30
+	tunDNSServer       = "198.18.0.1"    // the tun's /30 peer: routed into the tun, dns-hijack answers it
 	tunDNSNoPermission = "no-permission"
 )
 
@@ -96,6 +97,10 @@ func applyTun(cfg map[string]any) {
 		}
 	}
 	dns["enable"] = true
+	// Steam's Lepton (Android games) gives its container the src of `ip route get 1.1.1.1` and gateway <that /24>.1.
+	// With the tun at mihomo's default 198.18.0.1 both were the same address and the container had no network; at
+	// .2 the gateway is .1. The pool still starts at 198.18.0.4 (it reserves .1-.3).
+	dns["fake-ip-range"] = tunFakeIPRange
 	if dns["enhanced-mode"] == "fake-ip" {
 		have := map[any]bool{}
 		filter, _ := dns["fake-ip-filter"].([]any)

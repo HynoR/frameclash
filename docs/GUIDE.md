@@ -143,7 +143,7 @@ check finds that DNS permission has been repaired, FrameClash applies TUN DNS wi
 
 **TUN DNS** (`frameclash tun dns on|off`, the panel's DNS switch; default on): systemd-resolved sends its queries
 bound to `wlan0`, which bypasses the tun, so apps would get the network's (possibly poisoned) answers. With TUN DNS
-on, FrameClash sets DNS `198.18.0.2` and routing domain `~.` on the `frameclash0` link, so every lookup goes through
+on, FrameClash sets DNS `198.18.0.1` and routing domain `~.` on the `frameclash0` link, so every lookup goes through
 mihomo. `wlan0` is never changed; the settings vanish with the tun device. Without the polkit rule TUN still works and
 web/QUIC traffic is still routed by domain through mihomo's sniffer.
 
